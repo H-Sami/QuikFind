@@ -16,15 +16,13 @@ use tantivy::query::{
     BooleanQuery, FuzzyTermQuery, QueryParser,
 };
 use tantivy::schema::{Field, Schema, Value};
-use tantivy::{
-    doc, Index, IndexSettings, IndexWriter, ReloadPolicy, Searcher, TantivyDocument,
-};
+use tantivy::{doc, Index, IndexReader, IndexSettings, IndexWriter, ReloadPolicy, TantivyDocument};
 use tokio::sync::RwLock;
 use tracing::info;
 
 pub struct SearchEngine {
     pub index: Arc<RwLock<Option<Index>>>,
-    pub searcher: Arc<RwLock<Option<Searcher>>>,
+    pub reader: Arc<RwLock<Option<IndexReader>>>,
     pub writer: Arc<std::sync::Mutex<Option<IndexWriter>>>,
     schema: Schema,
     fields: SearchFields,
@@ -72,7 +70,7 @@ impl SearchEngine {
 
         Self {
             index: Arc::new(RwLock::new(None)),
-            searcher: Arc::new(RwLock::new(None)),
+            reader: Arc::new(RwLock::new(None)),
             writer: Arc::new(std::sync::Mutex::new(None)),
             schema,
             fields,
@@ -117,11 +115,10 @@ impl SearchEngine {
             .reload_policy(ReloadPolicy::OnCommitWithDelay)
             .try_into()
             .map_err(QuikFindError::Tantivy)?;
-        let searcher = reader.searcher();
 
         // Use blocking_write since Tauri setup doesn't have a tokio runtime context
         *self.index.blocking_write() = Some(index);
-        *self.searcher.blocking_write() = Some(searcher);
+        *self.reader.blocking_write() = Some(reader);
         *self.writer.lock().map_err(|e| QuikFindError::Generic(format!("Writer lock: {e}")))? = Some(writer);
 
         info!("Tantivy index initialized successfully");
@@ -192,20 +189,15 @@ impl SearchEngine {
         Ok(())
     }
 
-    /// Reloads the searcher to reflect recent index changes.
+    /// Forces an immediate reader reload so committed data is visible to searches without
+    /// waiting for the OnCommitWithDelay timer. Used by finish_batch_index and stop_indexing.
     ///
     /// # Errors
-    /// Returns an error if the index reader cannot be created.
+    /// Returns an error if the index reader cannot be reloaded.
     pub async fn reload_searcher(&self) -> Result<()> {
-        let index = self.index.read().await.clone();
-        if let Some(index) = index {
-            let reader = index
-                .reader_builder()
-                .reload_policy(ReloadPolicy::OnCommitWithDelay)
-                .try_into()
-                .map_err(QuikFindError::Tantivy)?;
-            let searcher = reader.searcher();
-            *self.searcher.write().await = Some(searcher);
+        let reader_lock = self.reader.read().await;
+        if let Some(reader) = reader_lock.as_ref() {
+            reader.reload().map_err(QuikFindError::Tantivy)?;
         }
         Ok(())
     }
@@ -241,45 +233,6 @@ impl SearchEngine {
             Some(score) if score > 0 => f32::from(score) / 100.0,
             _ => 0.0,
         }
-    }
-
-    // REASON: retained for potential direct Tantivy query API in future
-    #[allow(dead_code)]
-    fn tantivy_search(
-        &self,
-        query: &str,
-        limit: u32,
-        offset: u32,
-    ) -> Result<Vec<(f32, TantivyDocument)>> {
-        let searcher_lock = self.searcher.blocking_read();
-        let searcher = searcher_lock
-            .as_ref()
-            .ok_or(QuikFindError::SearcherNotReady)?;
-
-        let query_parser = QueryParser::for_index(
-            searcher.index(),
-            vec![self.fields.name, self.fields.content, self.fields.path],
-        );
-
-        let tantivy_query = query_parser
-            .parse_query(query)
-            .map_err(|e| QuikFindError::Generic(format!("Query parse error: {e}")))?;
-
-        let top_docs = searcher
-            .search(
-                &tantivy_query,
-                &TopDocs::with_limit((limit + offset) as usize),
-            )
-            .map_err(QuikFindError::Tantivy)?;
-
-        let results: Vec<(f32, TantivyDocument)> = top_docs
-            .into_iter()
-            .filter_map(|(score, doc_addr)| {
-                searcher.doc::<TantivyDocument>(doc_addr).ok().map(|doc| (score, doc))
-            })
-            .collect();
-
-        Ok(results)
     }
 
     fn doc_to_search_result(
@@ -371,7 +324,7 @@ impl SearchEngine {
     /// Performs a search across the index.
     ///
     /// # Errors
-    /// Returns an error if the searcher is not available.
+    /// Returns an error if the reader is not initialized.
     ///
     /// # Panics
     /// Panics if the query cache mutex is poisoned.
@@ -386,31 +339,37 @@ impl SearchEngine {
     ) -> Result<SearchResults> {
         let start = Instant::now();
 
+        if query.trim().is_empty() {
+            return Ok(SearchResults { results: Vec::new(), total: 0, query_time_ms: 0 });
+        }
+
         let cache_key = format!("{query}:{limit}:{offset}");
 
-        // SAFETY: cache mutex is never held across a panic boundary
-        #[allow(clippy::unwrap_used)]
-        {
-            let mut cache = self.query_cache.lock().unwrap();
-            if let Some(cached) = cache.get(&cache_key) {
+        // Do not serve cached results during indexing. Mid-index searches return partial or
+        // empty data; caching them would poison the cache and hide real results after indexing.
+        let is_currently_indexing = self.is_indexing.load(Ordering::Relaxed);
+        if !is_currently_indexing {
+            // SAFETY: cache mutex is never held across a panic boundary
+            #[allow(clippy::unwrap_used)]
+            if let Some(cached) = self.query_cache.lock().unwrap().get(&cache_key) {
                 return Ok(cached.clone());
             }
         }
 
-        if query.trim().is_empty() {
-            return Ok(SearchResults {
-                results: Vec::new(),
-                total: 0,
-                query_time_ms: 0,
-            });
-        }
-
         let query_lower = query.to_lowercase();
 
-        let searcher_lock = self.searcher.read().await;
-        let searcher = searcher_lock
-            .as_ref()
-            .ok_or(QuikFindError::SearcherNotReady)?;
+        // Get a fresh Searcher snapshot from the reader on every request.
+        // IndexReader with ReloadPolicy::OnCommitWithDelay auto-reloads after each commit,
+        // so reader.searcher() always reflects the latest committed state of the index.
+        // This is the correct pattern — storing a single Searcher snapshot at init time
+        // caused it to forever point at the empty index that existed at startup.
+        let searcher = {
+            let reader_lock = self.reader.read().await;
+            reader_lock
+                .as_ref()
+                .ok_or(QuikFindError::SearcherNotReady)?
+                .searcher()
+        };
 
         let query_fields = if enable_content_search {
             vec![self.fields.name, self.fields.content, self.fields.path]
@@ -450,22 +409,16 @@ impl SearchEngine {
         }
 
         let now_ts = chrono::Utc::now().timestamp();
-        let query_for_snippet = &query_lower;
         let query_len = query.len();
 
         let mut scored_results: Vec<SearchResult> = all_docs
             .into_iter()
             .map(|(tantivy_score, doc)| {
-                self.doc_to_search_result(tantivy_score, &doc, now_ts, query, query_for_snippet, query_len)
+                self.doc_to_search_result(tantivy_score, &doc, now_ts, query, &query_lower, query_len)
             })
             .collect();
 
-        scored_results.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
+        scored_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
         scored_results.dedup_by(|a, b| a.path == b.path);
 
         let total = scored_results.len() as u64;
@@ -480,26 +433,22 @@ impl SearchEngine {
         #[allow(clippy::cast_possible_truncation)]
         let query_time_ms = start.elapsed().as_millis() as u64;
 
-        let search_results = SearchResults {
-            results,
-            total,
-            query_time_ms,
-        };
+        let search_results = SearchResults { results, total, query_time_ms };
 
-        // SAFETY: cache mutex is never held across a panic boundary
-        #[allow(clippy::unwrap_used)]
-        {
-            let mut cache = self.query_cache.lock().unwrap();
-            cache.put(cache_key, search_results.clone());
-        }
-
-        if query.len() <= 3 {
-            // SAFETY: cache mutex is never held across a panic boundary
+        // Only cache when the index is stable — never during indexing
+        if !is_currently_indexing {
+            // SAFETY: cache mutexes are never held across a panic boundary
             #[allow(clippy::unwrap_used)]
-            self.popular_cache.lock().unwrap().put(
-                format!("pop:{query}:{limit}:{offset}"),
-                search_results.clone(),
-            );
+            {
+                self.query_cache.lock().unwrap().put(cache_key, search_results.clone());
+            }
+            if query.len() <= 3 {
+                #[allow(clippy::unwrap_used)]
+                self.popular_cache.lock().unwrap().put(
+                    format!("pop:{query}:{limit}:{offset}"),
+                    search_results.clone(),
+                );
+            }
         }
 
         Ok(search_results)
@@ -562,12 +511,8 @@ impl SearchEngine {
     }
 
     /// Starts a batch indexing session.
-    ///
-    /// # Errors
-    /// Returns an error if the indexing state cannot be updated.
-    pub fn start_batch_index(&self) -> Result<()> {
+    pub fn start_batch_index(&self) {
         self.is_indexing.store(true, Ordering::Relaxed);
-        Ok(())
     }
 
     /// Finishes a batch indexing session and reloads the searcher.
@@ -578,7 +523,14 @@ impl SearchEngine {
         self.commit()?;
         self.is_indexing.store(false, Ordering::Relaxed);
         self.reload_searcher().await?;
-        info!("Batch indexing complete, searcher reloaded");
+        // Invalidate query caches so post-index searches see real results
+        // SAFETY: cache mutexes are never held across a panic boundary
+        #[allow(clippy::unwrap_used)]
+        {
+            self.query_cache.lock().unwrap().clear();
+            self.popular_cache.lock().unwrap().clear();
+        }
+        info!("Batch indexing complete, searcher reloaded, caches cleared");
         Ok(())
     }
 
@@ -603,31 +555,26 @@ impl SearchEngine {
         Ok(())
     }
 
-    /// Completely wipes the index by deleting the entire index directory
-    /// and recreating a fresh empty index. This is the only reliable way
-    /// to guarantee zero old results remain.
+    /// Completely wipes the index by deleting the index directory and recreating it.
+    /// Use this over clear_index when you need to guarantee no old segments remain on disk.
     ///
     /// # Errors
-    /// Returns an error if the index directory cannot be deleted or recreated.
+    /// Returns an error if the directory cannot be deleted/recreated.
     pub async fn clear_index_completely(&self, index_dir: &Path) -> Result<()> {
-        // Close current writer and index
         {
-            let mut writer_lock = self.writer.lock().map_err(|e| {
-                QuikFindError::Generic(format!("Writer lock: {e}"))
-            })?;
+            let mut writer_lock = self
+                .writer
+                .lock()
+                .map_err(|e| QuikFindError::Generic(format!("Writer lock: {e}")))?;
             *writer_lock = None;
         }
 
-        // Drop current index and searcher
         *self.index.write().await = None;
-        *self.searcher.write().await = None;
+        // No self.searcher to reset — reader.searcher() is always called fresh
 
-        // Delete the entire index directory
         if index_dir.exists() {
             std::fs::remove_dir_all(index_dir).map_err(QuikFindError::Io)?;
         }
-
-        // Recreate directory and fresh index
         std::fs::create_dir_all(index_dir).map_err(QuikFindError::Io)?;
 
         let mmap_dir = MmapDirectory::open(index_dir)
@@ -636,9 +583,7 @@ impl SearchEngine {
         let index = Index::create(mmap_dir, self.schema.clone(), IndexSettings::default())
             .map_err(QuikFindError::Tantivy)?;
 
-        let writer = index
-            .writer(256_000_000)
-            .map_err(QuikFindError::Tantivy)?;
+        let writer = index.writer(256_000_000).map_err(QuikFindError::Tantivy)?;
 
         let reader = index
             .reader_builder()
@@ -646,15 +591,20 @@ impl SearchEngine {
             .try_into()
             .map_err(QuikFindError::Tantivy)?;
 
-        let searcher = reader.searcher();
-
         *self.index.write().await = Some(index);
-        *self.searcher.write().await = Some(searcher);
-        *self.writer.lock().map_err(|e| QuikFindError::Generic(format!("Writer lock: {e}")))? = Some(writer);
+        *self.reader.write().await = Some(reader);
+        *self.writer
+            .lock()
+            .map_err(|e| QuikFindError::Generic(format!("Writer lock: {e}")))? = Some(writer);
 
-        // Clear in-memory caches
-        self.query_cache.lock().map_err(|e| QuikFindError::Generic(format!("Cache lock: {e}")))?.clear();
-        self.popular_cache.lock().map_err(|e| QuikFindError::Generic(format!("Cache lock: {e}")))?.clear();
+        self.query_cache
+            .lock()
+            .map_err(|e| QuikFindError::Generic(format!("Cache lock: {e}")))?
+            .clear();
+        self.popular_cache
+            .lock()
+            .map_err(|e| QuikFindError::Generic(format!("Cache lock: {e}")))?
+            .clear();
 
         info!("Index completely wiped and recreated at {:?}", index_dir);
         Ok(())

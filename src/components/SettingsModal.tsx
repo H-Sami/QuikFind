@@ -1,8 +1,9 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { X, Monitor, Moon, Sun, LayoutGrid, Rows, Keyboard, Check, RotateCcw } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { useStore } from '../store';
-import { AppSettings } from '../types';
+import { AppSettings, IndexStatus } from '../types';
 import { useUIStore, ACCENT_PRESETS, ThemeMode, Density } from '../stores/uiStore';
 
 interface SettingsModalProps {
@@ -50,6 +51,8 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, initialT
   const [error, setError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'appearance' | 'shortcuts'>(initialTab);
   const [recordingId, setRecordingId] = useState<string | null>(null);
+  const [indexStatus, setIndexStatus] = useState<IndexStatus | null>(null);
+  const [isReindexing, setIsReindexing] = useState(false);
 
   const modalRef = useRef<HTMLDivElement>(null);
 
@@ -66,6 +69,23 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, initialT
       });
     }
   }, [isOpen, initialTab]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+
+    invoke<IndexStatus>('get_index_status')
+      .then(setIndexStatus)
+      .catch(() => {});
+
+    const unlisten = listen<IndexStatus>('index-progress', (event) => {
+      setIndexStatus(event.payload);
+      if (!event.payload.is_indexing) {
+        setIsReindexing(false);
+      }
+    });
+
+    return () => { unlisten.then(f => f()); };
+  }, [isOpen]);
 
   useEffect(() => {
     if (!recordingId) return;
@@ -118,6 +138,25 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, initialT
       showToast('Failed to save settings', 'error');
     }
   }, [localSettings, updateSettings, showToast]);
+
+  const handleReindex = useCallback(async () => {
+    setIsReindexing(true);
+    try {
+      await invoke('start_indexing', { paths: [] });
+    } catch (err) {
+      showToast('Failed to start indexing', 'error');
+      setIsReindexing(false);
+    }
+  }, [showToast]);
+
+  const handleStopIndex = useCallback(async () => {
+    try {
+      await invoke('stop_indexing');
+      setIsReindexing(false);
+    } catch {
+      // stop_indexing returns error if nothing is running — ignore it
+    }
+  }, []);
 
   const handleSave = useCallback(async () => {
     setIsSaving(true);
@@ -363,6 +402,80 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, initialT
                       <div className="w-9 h-5 bg-[var(--border-default)] rounded-full peer peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all duration-200 peer-checked:bg-[var(--accent)]" />
                     </label>
                   </div>
+                </div>
+
+                <div className="border-t border-[var(--border-subtle)]" />
+
+                <div>
+                  <SectionTitle
+                    title="Search Index"
+                    subtitle="QuikFind indexes your entire PC for instant search"
+                  />
+
+                  <div className="flex items-center justify-between py-2 mb-3">
+                    <div className="flex items-center gap-2">
+                      <span
+                        className={`w-2 h-2 rounded-full flex-shrink-0 ${
+                          indexStatus?.is_indexing
+                            ? 'bg-amber-400 animate-pulse'
+                            : 'bg-emerald-500'
+                        }`}
+                      />
+                      <div>
+                        <div className="text-xs text-[var(--text-primary)]">
+                          {indexStatus?.is_indexing
+                            ? 'Indexing in progress...'
+                            : 'Index ready'}
+                        </div>
+                        <div className="text-[11px] text-[var(--text-tertiary)]">
+                          {indexStatus
+                            ? `${indexStatus.files_indexed.toLocaleString()} files indexed`
+                            : 'Loading...'}
+                        </div>
+                      </div>
+                    </div>
+
+                    {indexStatus?.is_indexing ? (
+                      <button
+                        onClick={handleStopIndex}
+                        className="px-3 py-1.5 text-xs font-medium rounded-lg bg-red-500/10 text-red-400 hover:bg-red-500/20 transition-colors"
+                      >
+                        Stop
+                      </button>
+                    ) : (
+                      <button
+                        onClick={handleReindex}
+                        disabled={isReindexing}
+                        className="px-3 py-1.5 text-xs font-medium rounded-lg bg-[var(--accent)]/10 text-[var(--accent)] hover:bg-[var(--accent)]/20 transition-colors disabled:opacity-50"
+                      >
+                        Re-Index All Drives
+                      </button>
+                    )}
+                  </div>
+
+                  {indexStatus?.is_indexing && (
+                    <div className="space-y-1">
+                      <div className="flex-1 h-1.5 bg-[var(--border-subtle)] rounded-full overflow-hidden">
+                        <div
+                          className="h-full rounded-full transition-all duration-500"
+                          style={{
+                            width: `${Math.min(indexStatus.progress_percent, 100)}%`,
+                            backgroundColor: 'var(--accent)',
+                          }}
+                        />
+                      </div>
+                      <div className="flex justify-between text-[10px] text-[var(--text-tertiary)] tabular-nums">
+                        <span>{indexStatus.files_indexed.toLocaleString()} files</span>
+                        <span>{Math.round(indexStatus.progress_percent)}%</span>
+                      </div>
+                    </div>
+                  )}
+
+                  {indexStatus && indexStatus.errors.length > 0 && (
+                    <div className="mt-2 text-[10px] text-amber-400/70">
+                      {indexStatus.errors.length} path(s) had errors during last index
+                    </div>
+                  )}
                 </div>
 
                 <div className="border-t border-[var(--border-subtle)]" />

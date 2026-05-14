@@ -42,7 +42,6 @@ export interface AppSettings {
   enable_content_search: boolean;
   indexing_interval_minutes: number;
   fuzzy_threshold: number;
-  has_completed_onboarding: boolean;
   launch_on_startup: boolean;
 }
 

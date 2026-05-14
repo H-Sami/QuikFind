@@ -34,9 +34,18 @@ export function useKeyboardShortcuts({
   const openResultRef = useRef(openResult);
   openResultRef.current = openResult;
 
+  const shortcutsRef = useRef(useUIStore.getState().keyboardShortcuts);
+
+  useEffect(() => {
+    const unsub = useUIStore.subscribe(
+      (state) => { shortcutsRef.current = state.keyboardShortcuts; },
+    );
+    return unsub;
+  }, []);
+
   useEffect(() => {
     const handleGlobalKeyDown = (e: KeyboardEvent) => {
-      const shortcuts = useUIStore.getState().keyboardShortcuts;
+      const shortcuts = shortcutsRef.current;
       const target = e.target as HTMLElement;
       const isInput = target.tagName === 'INPUT' || target.tagName === 'TEXTAREA';
       const s = { query: queryRef.current, results: resultsRef.current, selectedIndex: selectedIndexRef.current, isSettingsOpen: isSettingsOpenRef.current };

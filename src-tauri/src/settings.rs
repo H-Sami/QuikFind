@@ -10,10 +10,6 @@ pub struct SettingsDatabase {
 }
 
 impl SettingsDatabase {
-    /// Opens or creates the settings database at the given config directory.
-    ///
-    /// # Errors
-    /// Returns an error if the database cannot be opened or tables cannot be initialized.
     pub fn open(config_dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(config_dir).map_err(QuikFindError::Io)?;
         let db_path = config_dir.join("quikfind.db");
@@ -77,126 +73,33 @@ impl SettingsDatabase {
         Ok(())
     }
 
-    /// Loads settings from the database.
-    ///
-    /// # Errors
-    /// Returns an error if the database cannot be read.
     pub fn load_settings(&self) -> Result<AppSettings> {
         let conn = self.conn.lock();
-
-        let mut stmt = conn
-            .prepare("SELECT key, value FROM settings")
-            .map_err(QuikFindError::Database)?;
-
-        let rows = stmt
-            .query_map([], |row| {
-                let key: String = row.get(0)?;
-                let value: String = row.get(1)?;
-                Ok((key, value))
-            })
-            .map_err(QuikFindError::Database)?;
-
-        let mut settings = AppSettings::default();
-
-        for row in rows {
-            let (key, value) = row.map_err(QuikFindError::Database)?;
-            match key.as_str() {
-                "indexed_paths" => {
-                    settings.indexed_paths =
-                        serde_json::from_str(&value).unwrap_or_default();
-                }
-                "excluded_patterns" => {
-                    settings.excluded_patterns =
-                        serde_json::from_str(&value).unwrap_or_default();
-                }
-                "max_results" => {
-                    settings.max_results = value.parse().unwrap_or(25);
-                }
-                "hotkey" => {
-                    settings.hotkey = value;
-                }
-                "theme" => {
-                    settings.theme = value;
-                }
-                "enable_content_search" => {
-                    settings.enable_content_search = value == "true";
-                }
-                "indexing_interval_minutes" => {
-                    settings.indexing_interval_minutes = value.parse().unwrap_or(30);
-                }
-                "fuzzy_threshold" => {
-                    settings.fuzzy_threshold = value.parse().unwrap_or(0.6);
-                }
-                "has_completed_onboarding" => {
-                    settings.has_completed_onboarding = value == "true";
-                }
-                "launch_on_startup" => {
-                    settings.launch_on_startup = value == "true";
-                }
-                _ => {}
-            }
+        let result: std::result::Result<String, _> = conn.query_row(
+            "SELECT value FROM settings WHERE key = 'app_settings'",
+            [],
+            |row| row.get(0),
+        );
+        match result {
+            Ok(json) => serde_json::from_str(&json).map_err(QuikFindError::Serialization),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(AppSettings::default()),
+            Err(e) => Err(QuikFindError::Database(e)),
         }
-
-        Ok(settings)
     }
 
-    /// Saves settings to the database.
-    ///
-    /// # Errors
-    /// Returns an error if the database cannot be written.
     pub fn save_settings(&self, settings: &AppSettings) -> Result<()> {
         let conn = self.conn.lock();
-
-        let pairs: Vec<(&str, String)> = vec![
-            (
-                "indexed_paths",
-                serde_json::to_string(&settings.indexed_paths)
-                    .map_err(QuikFindError::Serialization)?,
-            ),
-            (
-                "excluded_patterns",
-                serde_json::to_string(&settings.excluded_patterns)
-                    .map_err(QuikFindError::Serialization)?,
-            ),
-            ("max_results", settings.max_results.to_string()),
-            ("hotkey", settings.hotkey.clone()),
-            ("theme", settings.theme.clone()),
-            (
-                "enable_content_search",
-                settings.enable_content_search.to_string(),
-            ),
-            (
-                "indexing_interval_minutes",
-                settings.indexing_interval_minutes.to_string(),
-            ),
-            ("fuzzy_threshold", settings.fuzzy_threshold.to_string()),
-            (
-                "has_completed_onboarding",
-                settings.has_completed_onboarding.to_string(),
-            ),
-            (
-                "launch_on_startup",
-                settings.launch_on_startup.to_string(),
-            ),
-        ];
-
-        for (key, value) in &pairs {
-            conn.execute(
-                "INSERT INTO settings (key, value) VALUES (?1, ?2)
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                params![key, value],
-            )
-            .map_err(QuikFindError::Database)?;
-        }
-
-        info!("Settings saved to database");
+        let json =
+            serde_json::to_string(settings).map_err(QuikFindError::Serialization)?;
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('app_settings', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![json],
+        )
+        .map_err(QuikFindError::Database)?;
         Ok(())
     }
 
-    /// Adds an item to the history.
-    ///
-    /// # Errors
-    /// Returns an error if the database cannot be written.
     pub fn add_history(&self, item: &HistoryItem) -> Result<()> {
         let conn = self.conn.lock();
 
@@ -211,10 +114,6 @@ impl SettingsDatabase {
         Ok(())
     }
 
-    /// Gets history items from the database.
-    ///
-    /// # Errors
-    /// Returns an error if the database cannot be read.
     pub fn get_history(&self, limit: u32) -> Result<Vec<HistoryItem>> {
         let conn = self.conn.lock();
 
@@ -242,10 +141,6 @@ impl SettingsDatabase {
         Ok(items)
     }
 
-    /// Records an indexed file in the database.
-    ///
-    /// # Errors
-    /// Returns an error if the database cannot be written.
     pub fn record_indexed_file(
         &self,
         path: &str,
@@ -271,10 +166,6 @@ impl SettingsDatabase {
         Ok(())
     }
 
-    /// Removes an indexed file from the database and returns its doc ID.
-    ///
-    /// # Errors
-    /// Returns an error if the database cannot be written.
     pub fn remove_indexed_file(&self, path: &str) -> Result<Option<String>> {
         let conn = self.conn.lock();
 
@@ -295,10 +186,6 @@ impl SettingsDatabase {
         Ok(doc_id)
     }
 
-    /// Returns the number of indexed files.
-    ///
-    /// # Errors
-    /// Returns an error if the database cannot be read.
     pub fn get_indexed_file_count(&self) -> Result<u64> {
         let conn = self.conn.lock();
 
@@ -309,10 +196,6 @@ impl SettingsDatabase {
         Ok(count)
     }
 
-    /// Gets the saved window state.
-    ///
-    /// # Errors
-    /// Returns an error if the database cannot be read.
     pub fn get_window_state(&self) -> Result<Option<String>> {
         let conn = self.conn.lock();
 
@@ -329,10 +212,6 @@ impl SettingsDatabase {
         }
     }
 
-    /// Saves the window state.
-    ///
-    /// # Errors
-    /// Returns an error if the database cannot be written.
     pub fn save_window_state(&self, json: &str) -> Result<()> {
         let conn = self.conn.lock();
 
@@ -346,10 +225,6 @@ impl SettingsDatabase {
         Ok(())
     }
 
-    /// Clears all indexed file records from the database.
-    ///
-    /// # Errors
-    /// Returns an error if the database cannot be written.
     pub fn clear_indexed_files(&self) -> Result<()> {
         let conn = self.conn.lock();
 
@@ -359,10 +234,6 @@ impl SettingsDatabase {
         Ok(())
     }
 
-    /// Caches an app entry in the database.
-    ///
-    /// # Errors
-    /// Returns an error if the database cannot be written.
     pub fn cache_app(&self, id: &str, name: &str, path: &str, _icon: Option<&[u8]>) -> Result<()> {
         let conn = self.conn.lock();
 
@@ -381,10 +252,6 @@ impl SettingsDatabase {
         Ok(())
     }
 
-    /// Returns all cached apps from the database.
-    ///
-    /// # Errors
-    /// Returns an error if the database cannot be read.
     pub fn get_cached_apps(&self) -> Result<Vec<(String, String, String)>> {
         let conn = self.conn.lock();
 
@@ -393,9 +260,7 @@ impl SettingsDatabase {
             .map_err(QuikFindError::Database)?;
 
         let apps = stmt
-            .query_map([], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
             .map_err(QuikFindError::Database)?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(QuikFindError::Database)?;

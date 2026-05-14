@@ -1,3 +1,4 @@
+use crate::platform::is_on_desktop;
 use rdev::{listen, EventType, Key};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -42,36 +43,7 @@ fn is_quikfind_visible(app: &AppHandle) -> bool {
         .unwrap_or(false)
 }
 
-#[cfg(windows)]
-#[allow(clippy::cast_sign_loss)]
-fn is_on_desktop() -> bool {
-    // SAFETY: win32 API calls are safe as long as pointers are valid (hwnd is null-checked)
-    unsafe {
-        let hwnd = winapi::um::winuser::GetForegroundWindow();
-        if hwnd.is_null() {
-            return false;
-        }
 
-        let mut title = [0u16; 256];
-        let len = winapi::um::winuser::GetWindowTextW(hwnd, title.as_mut_ptr(), 256);
-
-        if len == 0 {
-            return true; // Empty title often means desktop
-        }
-
-        let title_str = String::from_utf16_lossy(&title[..len as usize]);
-
-        // Common desktop window identifiers
-        title_str == "Program Manager"
-            || title_str.contains("Desktop")
-            || title_str.is_empty()
-    }
-}
-
-#[cfg(not(windows))]
-fn is_on_desktop() -> bool {
-    false
-}
 
 fn key_to_char(key: Key) -> Option<char> {
     match key {

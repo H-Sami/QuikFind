@@ -22,7 +22,7 @@ const defaultSettings: AppSettings = {
   enable_content_search: true,
   indexing_interval_minutes: 30,
   fuzzy_threshold: 0.6,
-  has_completed_onboarding: false,
+
   launch_on_startup: false,
 };
 
@@ -47,8 +47,6 @@ export const useStore = create<AppStore>((set, get) => ({
     try {
       await invoke('update_settings', { settings: updated });
       set({ settings: updated });
-      // NOTE: We no longer auto-start indexing here.
-      // Indexing is now only triggered manually from Settings or Onboarding.
     } catch (error) {
       console.error('Failed to update settings:', error);
     }

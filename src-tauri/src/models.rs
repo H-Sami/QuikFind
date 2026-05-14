@@ -90,7 +90,6 @@ pub struct AppSettings {
     pub enable_content_search: bool,
     pub indexing_interval_minutes: u32,
     pub fuzzy_threshold: f32,
-    pub has_completed_onboarding: bool,
     pub launch_on_startup: bool,
 }
 
@@ -113,7 +112,6 @@ impl Default for AppSettings {
             enable_content_search: true,
             indexing_interval_minutes: 30,
             fuzzy_threshold: 0.6,
-            has_completed_onboarding: false,
             launch_on_startup: false,
         }
     }

@@ -10,7 +10,6 @@ import ToastOverlay from './components/ToastOverlay';
 import { IndexStatus } from './types';
 import { useStore } from './store';
 import { useUIStore } from './stores/uiStore';
-import { useWindowState } from './hooks/useWindowState';
 import { useSearch } from './hooks/useSearch';
 import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts';
 import { useOpenResult } from './hooks/useOpenResult';
@@ -35,13 +34,6 @@ function App() {
   const lastNavMethodRef = useRef<'keyboard' | 'mouse'>('mouse');
   const isSettingsOpenRef = useRef(isSettingsOpen);
   isSettingsOpenRef.current = isSettingsOpen;
-
-  useWindowState();
-
-  useEffect(() => {
-    const win = getCurrentWindow();
-    win.hide();
-  }, []);
 
   useKeyboardShortcuts({
     searchInputRef,
@@ -165,7 +157,6 @@ function App() {
       <div className="flex-1 flex px-4 pb-3 min-h-0">
         <div className="flex flex-col flex-1 min-w-0">
           <ResultsList
-            key={query}
             results={results}
             selectedIndex={selectedIndex}
             onClick={handleClickResult}

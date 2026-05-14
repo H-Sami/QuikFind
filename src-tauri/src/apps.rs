@@ -342,6 +342,7 @@ fn extract_macos_icon(app_path: &PathBuf) -> Option<String> {
 }
 
 #[must_use]
+#[allow(dead_code)]
 pub fn base64_encoding(data: &[u8]) -> String {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut result = String::new();

@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { FileText, Folder, AppWindow } from 'lucide-react';
 import { SearchResult } from '../types';
-import { VIRTUALIZATION_THRESHOLD } from '../hooks/constants';
+import { ITEM_HEIGHT, VIRTUALIZATION_THRESHOLD } from '../hooks/constants';
 
 interface ResultsListProps {
   results: SearchResult[];
@@ -11,8 +11,6 @@ interface ResultsListProps {
   query: string;
   lastNavMethodRef: { current: 'keyboard' | 'mouse' };
 }
-
-const ITEM_HEIGHT = 60;
 
 const OVERSCAN = 5;
 

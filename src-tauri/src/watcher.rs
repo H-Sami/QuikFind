@@ -1,5 +1,6 @@
 use crate::error::{QuikFindError, Result};
-use crate::models::{compute_file_id, is_text_extension, FileEntry, ResultKind};
+use crate::indexer::build_file_entry;
+use crate::models::compute_file_id;
 use crate::search::SearchEngine;
 use crate::settings::SettingsDatabase;
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -18,12 +19,11 @@ fn spawn_watcher_loop(
 ) {
     tokio::spawn(async move {
         let debounce_duration = Duration::from_millis(150);
+        let cache_size = std::num::NonZeroUsize::new(2000).expect("2000 is non-zero");
         let debounce_map: Arc<parking_lot::Mutex<
             lru::LruCache<String, Instant>,
         >> = Arc::new(parking_lot::Mutex::new(
-            // SAFETY: 2000 is a non-zero compile-time constant
-            #[allow(clippy::unwrap_used)]
-            lru::LruCache::new(std::num::NonZeroUsize::new(2000).unwrap()),
+            lru::LruCache::new(cache_size),
         ));
         let mut pending_create: std::collections::VecDeque<std::path::PathBuf> = std::collections::VecDeque::new();
         let mut pending_modify: std::collections::VecDeque<std::path::PathBuf> = std::collections::VecDeque::new();
@@ -110,6 +110,52 @@ fn spawn_watcher_loop(
     });
 }
 
+async fn upsert_file(
+    path: &Path,
+    search_engine: &SearchEngine,
+    db: &RwLock<SettingsDatabase>,
+) -> Result<()> {
+    if path.is_dir() {
+        return Ok(());
+    }
+
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return Ok(());
+    };
+
+    let db_guard = db.read().await;
+    if let Ok(Some(old_doc_id)) = db_guard.remove_indexed_file(&path.to_string_lossy()) {
+        search_engine.delete_document(&old_doc_id).ok();
+    }
+
+    let entry = build_file_entry(path, &metadata);
+    search_engine.index_document(&entry)?;
+
+    let doc_id = compute_file_id(&entry.path, entry.size, entry.modified);
+    db_guard
+        .record_indexed_file(&entry.path, entry.size, entry.modified, &doc_id)
+        .ok();
+
+    debug!("Indexed file: {}", entry.path);
+    Ok(())
+}
+
+async fn handle_remove(
+    path: &Path,
+    search_engine: &SearchEngine,
+    db: &RwLock<SettingsDatabase>,
+) -> Result<()> {
+    let path_str = path.to_string_lossy().to_string();
+    let db_guard = db.read().await;
+
+    if let Ok(Some(doc_id)) = db_guard.remove_indexed_file(&path_str) {
+        search_engine.delete_document(&doc_id).ok();
+        debug!("Removed indexed file: {}", path_str);
+    }
+
+    Ok(())
+}
+
 async fn process_pending(
     pending_create: &mut std::collections::VecDeque<std::path::PathBuf>,
     pending_modify: &mut std::collections::VecDeque<std::path::PathBuf>,
@@ -125,13 +171,13 @@ async fn process_pending(
         needs_commit.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     while let Some(path) = pending_modify.pop_front() {
-        if let Err(e) = handle_modify(&path, search_engine, db).await {
+        if let Err(e) = upsert_file(&path, search_engine, db).await {
             error!("Watcher modify error for {}: {}", path.display(), e);
         }
         needs_commit.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     while let Some(path) = pending_create.pop_front() {
-        if let Err(e) = handle_create(&path, search_engine, db).await {
+        if let Err(e) = upsert_file(&path, search_engine, db).await {
             error!("Watcher create error for {}: {}", path.display(), e);
         }
     }
@@ -162,13 +208,6 @@ impl FileWatcher {
         }
     }
 
-    /// Starts watching the given paths for file changes.
-    ///
-    /// # Errors
-    /// Returns an error if the watcher cannot be created or paths cannot be watched.
-    ///
-    /// # Panics
-    /// Panics if the LRU cache size is not a valid non-zero value.
     pub fn start(
         &self,
         paths: &[String],
@@ -225,10 +264,6 @@ impl FileWatcher {
         Ok(())
     }
 
-    /// Stops the file watcher.
-    ///
-    /// # Errors
-    /// Returns an error if the watcher lock is poisoned.
     pub fn stop(&self) -> Result<()> {
         self.is_running.store(false, Ordering::Relaxed);
 
@@ -249,10 +284,6 @@ impl FileWatcher {
         self.is_running.load(Ordering::Relaxed)
     }
 
-    /// Updates the set of watched paths.
-    ///
-    /// # Errors
-    /// Returns an error if the watcher cannot be restarted.
     pub fn update_watched_paths(
         &self,
         new_paths: &[String],
@@ -263,125 +294,4 @@ impl FileWatcher {
         std::thread::sleep(Duration::from_millis(50));
         self.start(new_paths, search_engine, db)
     }
-}
-
-async fn handle_create(
-    path: &Path,
-    search_engine: &SearchEngine,
-    db: &RwLock<SettingsDatabase>,
-) -> Result<()> {
-    if path.is_dir() {
-        return Ok(());
-    }
-
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return Ok(());
-    };
-
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let size = metadata.len();
-    // REASON: Unix timestamps fit in i64 for billions of years; safe truncation
-    #[allow(clippy::cast_possible_wrap)]
-    let modified = metadata
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_secs() as i64);
-
-    let content = if metadata.is_file() && is_text_extension(&path.to_string_lossy()) {
-        crate::indexer::extract_text_content(path)
-    } else {
-        None
-    };
-
-    let entry = FileEntry {
-        path: path.to_string_lossy().to_string(),
-        name,
-        size,
-        modified,
-        kind: ResultKind::File,
-        content,
-    };
-
-    search_engine.index_document(&entry)?;
-
-    let doc_id = compute_file_id(&entry.path, entry.size, entry.modified);
-    let db = db.read().await;
-    db.record_indexed_file(&entry.path, entry.size, entry.modified, &doc_id)
-        .ok();
-
-    debug!("Indexed new file: {}", entry.path);
-    Ok(())
-}
-
-async fn handle_modify(
-    path: &Path,
-    search_engine: &SearchEngine,
-    db: &RwLock<SettingsDatabase>,
-) -> Result<()> {
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return Ok(());
-    };
-
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let size = metadata.len();
-    // REASON: Unix timestamps fit in i64 for billions of years; safe truncation
-    #[allow(clippy::cast_possible_wrap)]
-    let modified = metadata
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_secs() as i64);
-
-    let db_guard = db.read().await;
-    if let Ok(Some(old_doc_id)) = db_guard.remove_indexed_file(&path.to_string_lossy()) {
-        search_engine.delete_document(&old_doc_id).ok();
-    }
-
-    let content = if metadata.is_file() && is_text_extension(&path.to_string_lossy()) {
-        crate::indexer::extract_text_content(path)
-    } else {
-        None
-    };
-
-    let entry = FileEntry {
-        path: path.to_string_lossy().to_string(),
-        name,
-        size,
-        modified,
-        kind: ResultKind::File,
-        content,
-    };
-
-    search_engine.index_document(&entry)?;
-
-    let new_doc_id = compute_file_id(&entry.path, entry.size, entry.modified);
-    db_guard
-        .record_indexed_file(&entry.path, entry.size, entry.modified, &new_doc_id)
-        .ok();
-
-    debug!("Re-indexed modified file: {}", entry.path);
-    Ok(())
-}
-
-async fn handle_remove(
-    path: &Path,
-    search_engine: &SearchEngine,
-    db: &RwLock<SettingsDatabase>,
-) -> Result<()> {
-    let path_str = path.to_string_lossy().to_string();
-    let db_guard = db.read().await;
-
-    if let Ok(Some(doc_id)) = db_guard.remove_indexed_file(&path_str) {
-        search_engine.delete_document(&doc_id).ok();
-        debug!("Removed indexed file: {}", path_str);
-    }
-
-    Ok(())
 }

@@ -9,7 +9,7 @@ use std::io::Read;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
@@ -37,13 +37,6 @@ impl Indexer {
         Self { search_engine, db }
     }
 
-    /// Indexes all files in the given paths.
-    ///
-    /// # Errors
-    /// Returns an error if indexing fails.
-    ///
-    /// # Panics
-    /// Panics if a mutex is poisoned.
     pub async fn index_paths(
         &self,
         paths: Vec<String>,
@@ -67,7 +60,7 @@ impl Indexer {
             progress_tx: &progress_tx,
         };
 
-        self.search_engine.start_batch_index()?;
+        self.search_engine.start_batch_index();
 
         progress_tx
             .send(crate::models::IndexingProgress {
@@ -86,7 +79,8 @@ impl Indexer {
             }
 
             if path.is_file() {
-                if let Err(e) = self.index_file(path, ctx.exclude_set, ctx.errors, ctx.files_indexed) {
+                if let Err(e) = self.index_file(path, ctx.exclude_set, ctx.files_indexed)
+                {
                     error!("Failed to index file {}: {}", path_str, e);
                 }
                 total_files.fetch_add(1, Ordering::Relaxed);
@@ -109,7 +103,6 @@ impl Indexer {
 
         let elapsed = start.elapsed();
         let indexed_count = files_indexed.load(Ordering::Relaxed);
-        // REASON: performance metric for logging; precision loss is acceptable
         #[allow(clippy::cast_precision_loss)]
         let files_per_min = indexed_count as f64 / elapsed.as_secs_f64() * 60.0;
         info!(
@@ -134,75 +127,58 @@ impl Indexer {
         ctx: &IndexingContext<'_>,
     ) {
         for chunk in entries.chunks(COMMIT_BATCH_SIZE) {
-            let results: Vec<_> = chunk
+            // Phase 1: CPU-parallel processing (no lock held)
+            let file_entries: Vec<_> = chunk
                 .par_iter()
                 .filter_map(|entry| {
-                    let entry_path = entry.path();
-                    if is_excluded(&entry_path, ctx.exclude_set) {
-                        return None;
-                    }
-                    let Ok(metadata) = entry.metadata() else {
-                        return None;
-                    };
-                    if metadata.is_file()
-                        && metadata.len() > MAX_BINARY_SKIP_SIZE
-                        && !is_text_extension(&entry_path.to_string_lossy())
-                    {
-                        return None;
-                    }
-                    match process_entry(entry) {
-                        Ok(file_entry) => Some(file_entry),
-                        Err(e) => {
-                        // SAFETY: error mutex only held briefly, never across await
-                        ctx.errors.lock().push(format!("{}: {}", entry_path.display(), e));
-                        None
-                        }
-                    }
+                    let path = entry.path();
+                    if is_excluded(&path, ctx.exclude_set) { return None; }
+                    let Ok(meta) = entry.metadata() else { return None; };
+                    if meta.is_file()
+                        && meta.len() > MAX_BINARY_SKIP_SIZE
+                        && !is_text_extension(&path.to_string_lossy())
+                    { return None; }
+                    process_entry(entry).ok()
                 })
                 .collect();
 
-            let batch_count = results.len();
-            for file_entry in &results {
-                let db = self.db.read().await;
-                let doc_id = compute_file_id(
-                    &file_entry.path,
-                    file_entry.size,
-                    file_entry.modified,
-                );
-                match self.search_engine.index_document(file_entry) {
+            // Phase 2: Index documents into Tantivy (in-memory, no DB)
+            let mut indexed = Vec::with_capacity(file_entries.len());
+            for fe in &file_entries {
+                match self.search_engine.index_document(fe) {
                     Ok(()) => {
-                        db.record_indexed_file(
-                            &file_entry.path,
-                            file_entry.size,
-                            file_entry.modified,
-                            &doc_id,
-                        )
-                        .ok();
+                        indexed.push(fe);
                         ctx.files_indexed.fetch_add(1, Ordering::Relaxed);
                     }
-                    Err(e) => {
-                        ctx.errors.lock().push(format!("{}: {}", file_entry.path, e));
-                    }
+                    Err(e) => ctx.errors.lock().push(format!("{}: {e}", fe.path)),
                 }
             }
 
+            // Phase 3: Single lock acquisition for all DB writes
+            {
+                let db = self.db.read().await;
+                for fe in &indexed {
+                    let doc_id = compute_file_id(&fe.path, fe.size, fe.modified);
+                    db.record_indexed_file(&fe.path, fe.size, fe.modified, &doc_id).ok();
+                }
+            }
+
+            // Commit Tantivy every COMMIT_BATCH_SIZE docs
             let indexed_count = ctx.files_indexed.load(Ordering::Relaxed);
-            if indexed_count % (COMMIT_BATCH_SIZE as u64) < batch_count as u64 {
+            if indexed_count % (COMMIT_BATCH_SIZE as u64) < indexed.len() as u64 {
                 self.search_engine.commit().ok();
             }
 
+            // Throttled progress reporting
             {
-                // SAFETY: progress mutex never held across await points
                 let mut last = ctx.last_progress.lock();
-                if last.elapsed() >= std::time::Duration::from_millis(PROGRESS_INTERVAL_MS) {
-                    ctx.progress_tx
-                        .send(crate::models::IndexingProgress {
-                            files_indexed: indexed_count,
-                            total_files: ctx.total_files.load(Ordering::Relaxed),
-                            current_file: results.last().map(|r| r.path.clone()),
-                            errors: ctx.errors.lock().clone(),
-                        })
-                        .ok();
+                if last.elapsed() >= Duration::from_millis(PROGRESS_INTERVAL_MS) {
+                    ctx.progress_tx.send(crate::models::IndexingProgress {
+                        files_indexed: ctx.files_indexed.load(Ordering::Relaxed),
+                        total_files:   ctx.total_files.load(Ordering::Relaxed),
+                        current_file:  indexed.last().map(|r| r.path.clone()),
+                        errors:        ctx.errors.lock().clone(),
+                    }).ok();
                     *last = Instant::now();
                 }
             }
@@ -213,26 +189,19 @@ impl Indexer {
         &self,
         path: &Path,
         exclude_set: &GlobSet,
-        errors: &parking_lot::Mutex<Vec<String>>,
         files_indexed: &AtomicU64,
     ) -> Result<()> {
         if is_excluded(path, exclude_set) {
             return Ok(());
         }
 
-        match process_single_file(path) {
-            Ok(file_entry) => {
-                self.search_engine
-                    .index_document(&file_entry)
-                    .map_err(|e| QuikFindError::Generic(format!("Index doc: {e}")))?;
-                files_indexed.fetch_add(1, Ordering::Relaxed);
-                Ok(())
-            }
-            Err(e) => {
-                errors.lock().push(format!("{}: {}", path.display(), e));
-                Err(e)
-            }
-        }
+        let metadata = std::fs::metadata(path).map_err(QuikFindError::Io)?;
+        let file_entry = build_file_entry(path, &metadata);
+    self.search_engine
+        .index_document(&file_entry)
+        .map_err(|e| QuikFindError::Generic(format!("Index doc: {e}")))?;
+    files_indexed.fetch_add(1, Ordering::Relaxed);
+    Ok(())
     }
 }
 
@@ -267,12 +236,7 @@ fn is_excluded(path: &Path, exclude_set: &GlobSet) -> bool {
     false
 }
 
-fn process_entry(entry: &jwalk::DirEntry<((), ())>) -> Result<FileEntry> {
-    let path = entry.path();
-    let metadata = entry
-        .metadata()
-        .map_err(|e| QuikFindError::Generic(format!("Metadata: {e}")))?;
-
+pub(crate) fn build_file_entry(path: &Path, metadata: &std::fs::Metadata) -> FileEntry {
     let file_type = metadata.file_type();
     let kind = if file_type.is_dir() {
         ResultKind::Folder
@@ -286,7 +250,6 @@ fn process_entry(entry: &jwalk::DirEntry<((), ())>) -> Result<FileEntry> {
         0
     };
 
-    // REASON: Unix timestamps fit in i64 for billions of years; safe truncation
     #[allow(clippy::cast_possible_wrap)]
     let modified = metadata
         .modified()
@@ -300,52 +263,27 @@ fn process_entry(entry: &jwalk::DirEntry<((), ())>) -> Result<FileEntry> {
         .unwrap_or_default();
 
     let content = if file_type.is_file() && is_text_extension(&path.to_string_lossy()) {
-        extract_text_content(&path)
+        extract_text_content(path)
     } else {
         None
     };
 
-    Ok(FileEntry {
+    FileEntry {
         path: path.to_string_lossy().to_string(),
         name,
         size,
         modified,
         kind,
         content,
-    })
+    }
 }
 
-fn process_single_file(path: &Path) -> Result<FileEntry> {
-    let metadata = std::fs::metadata(path).map_err(QuikFindError::Io)?;
-
-    let size = metadata.len();
-    // REASON: Unix timestamps fit in i64 for billions of years; safe truncation
-    #[allow(clippy::cast_possible_wrap)]
-    let modified = metadata
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_secs() as i64);
-
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default();
-
-    let content = if metadata.is_file() && is_text_extension(&path.to_string_lossy()) {
-        extract_text_content(path)
-    } else {
-        None
-    };
-
-    Ok(FileEntry {
-        path: path.to_string_lossy().to_string(),
-        name,
-        size,
-        modified,
-        kind: ResultKind::File,
-        content,
-    })
+fn process_entry(entry: &jwalk::DirEntry<((), ())>) -> Result<FileEntry> {
+    let path = entry.path();
+    let metadata = entry
+        .metadata()
+        .map_err(|e| QuikFindError::Generic(format!("Metadata: {e}")))?;
+    Ok(build_file_entry(&path, &metadata))
 }
 
 #[must_use]
