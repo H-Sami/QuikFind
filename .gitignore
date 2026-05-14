@@ -1,0 +1,22 @@
+# Dependencies
+node_modules/
+dist/
+
+# Rust build artifacts (this is the huge folder)
+src-tauri/target/
+
+# Tauri temporary files
+src-tauri/.cargo/
+
+# Logs and environment
+*.log
+.env
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Optional: ignore large assets if any
+*.exe
+*.msi
+*.AppImage
