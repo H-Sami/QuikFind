@@ -16,7 +16,19 @@ src-tauri/.cargo/
 .DS_Store
 Thumbs.db
 
-# Optional: ignore large assets if any
+# IDE directories
+.vscode/
+.idea/
+
+# Build artifacts
 *.exe
 *.msi
 *.AppImage
+
+# Auto-generated Tauri schemas (regenerated on each build)
+src-tauri/gen/schemas/
+
+# Platform-specific icons not needed for Windows-only build
+src-tauri/icons/ios/
+src-tauri/icons/android/
+src-tauri/icons/icon.icns
