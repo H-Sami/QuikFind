@@ -32,6 +32,14 @@ npm install
 npm run tauri dev
 ```
 
+## First Run
+
+On first launch, QuikFind indexes all files and folders on the selected drives.
+Depending on the total number of files on your PC, this initial indexing may take
+**several minutes**. During this time search results will be partial — only
+already-indexed files will appear. The indexer runs in the background, and results
+improve incrementally as indexing progresses.
+
 ## Build
 
 ```bash
