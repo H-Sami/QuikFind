@@ -4,6 +4,9 @@ Fast, private, local desktop search & launcher for Windows.
 
 Built with **Rust (Tauri 2)** + **React 18** + **TypeScript** + **Tailwind CSS**.
 
+<img width="1026" height="344" alt="image" src="https://github.com/user-attachments/assets/13cc3e7b-f9b6-4cd6-8afa-19923496dbbc" />
+
+
 ## Features
 
 - Full-text file search (Tantivy) + fuzzy matching (Nucleo)
