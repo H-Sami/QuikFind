@@ -112,7 +112,7 @@ impl SearchEngine {
 
         let reader = index
             .reader_builder()
-            .reload_policy(ReloadPolicy::OnCommitWithDelay)
+            .reload_policy(ReloadPolicy::Manual)
             .try_into()
             .map_err(QuikFindError::Tantivy)?;
 
@@ -173,6 +173,38 @@ impl SearchEngine {
         Ok(())
     }
 
+    /// Replaces an existing document by deleting the old one (matched by its `id` field)
+    /// and adding a new one. Used during content enrichment (Phase 2) where only the
+    /// `content` field changes.
+    ///
+    /// # Errors
+    /// Returns an error if the index writer is not available or Tantivy operations fail.
+    pub fn update_document(&self, entry: &FileEntry) -> Result<()> {
+        let file_id = compute_file_id(&entry.path, entry.size, entry.modified);
+        let mut writer_lock = self
+            .writer
+            .lock()
+            .map_err(|e| QuikFindError::Generic(format!("Writer lock: {e}")))?;
+        let writer = writer_lock
+            .as_mut()
+            .ok_or(QuikFindError::WriterNotReady)?;
+
+        let term = tantivy::Term::from_field_text(self.fields.id, &file_id);
+        writer.delete_term(term);
+
+        let document = doc!(
+            self.fields.path => entry.path.as_str(),
+            self.fields.name => entry.name.as_str(),
+            self.fields.content => entry.content.as_deref().unwrap_or(""),
+            self.fields.size => entry.size,
+            self.fields.modified => entry.modified,
+            self.fields.kind => entry.kind.as_str(),
+            self.fields.id => file_id.as_str(),
+        );
+        writer.add_document(document).map_err(QuikFindError::Tantivy)?;
+        Ok(())
+    }
+
     /// Commits pending changes to the index.
     ///
     /// # Errors
@@ -189,8 +221,8 @@ impl SearchEngine {
         Ok(())
     }
 
-    /// Forces an immediate reader reload so committed data is visible to searches without
-    /// waiting for the OnCommitWithDelay timer. Used by finish_batch_index and stop_indexing.
+    /// Forces an immediate reader reload so committed data is visible to searches.
+    /// Used by finish_batch_index and the file watcher.
     ///
     /// # Errors
     /// Returns an error if the index reader cannot be reloaded.
@@ -241,8 +273,6 @@ impl SearchEngine {
         doc: &TantivyDocument,
         now_ts: i64,
         orig_query: &str,
-        query_for_snippet: &str,
-        query_len: usize,
     ) -> SearchResult {
         let path = doc
             .get_first(self.fields.path)
@@ -285,29 +315,6 @@ impl SearchEngine {
 
         let final_score = name_score.mul_add(3.0, tantivy_score.max(0.0)) + (recency_boost * 0.5);
 
-        let snippet = doc
-            .get_first(self.fields.content)
-            .and_then(|v| v.as_str())
-            .and_then(|c| {
-                if c.is_empty() {
-                    return None;
-                }
-                Some(
-                    c.to_lowercase().find(query_for_snippet).map_or_else(
-                        || c[..c.len().min(100)].to_string(),
-                        |pos| {
-                            let start = pos.saturating_sub(40);
-                            let end = (pos + query_len + 40).min(c.len());
-                            let mut snippet = String::with_capacity(90);
-                            snippet.push_str("...");
-                            snippet.push_str(&c[start..end]);
-                            snippet.push_str("...");
-                            snippet
-                        },
-                    ),
-                )
-            });
-
         SearchResult {
             id: id.to_string(),
             path: path.to_string(),
@@ -316,7 +323,6 @@ impl SearchEngine {
             score: final_score,
             size,
             modified,
-            content_snippet: snippet,
             icon: None,
         }
     }
@@ -359,10 +365,8 @@ impl SearchEngine {
         let query_lower = query.to_lowercase();
 
         // Get a fresh Searcher snapshot from the reader on every request.
-        // IndexReader with ReloadPolicy::OnCommitWithDelay auto-reloads after each commit,
-        // so reader.searcher() always reflects the latest committed state of the index.
-        // This is the correct pattern — storing a single Searcher snapshot at init time
-        // caused it to forever point at the empty index that existed at startup.
+        // reload_searcher() is called explicitly after every commit, so the reader
+        // always reflects the latest committed state.
         let searcher = {
             let reader_lock = self.reader.read().await;
             reader_lock
@@ -409,12 +413,11 @@ impl SearchEngine {
         }
 
         let now_ts = chrono::Utc::now().timestamp();
-        let query_len = query.len();
 
         let mut scored_results: Vec<SearchResult> = all_docs
             .into_iter()
             .map(|(tantivy_score, doc)| {
-                self.doc_to_search_result(tantivy_score, &doc, now_ts, query, &query_lower, query_len)
+                self.doc_to_search_result(tantivy_score, &doc, now_ts, query)
             })
             .collect();
 
@@ -587,7 +590,7 @@ impl SearchEngine {
 
         let reader = index
             .reader_builder()
-            .reload_policy(ReloadPolicy::OnCommitWithDelay)
+            .reload_policy(ReloadPolicy::Manual)
             .try_into()
             .map_err(QuikFindError::Tantivy)?;
 

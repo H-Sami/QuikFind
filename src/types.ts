@@ -6,7 +6,6 @@ export interface SearchResult {
   score: number;
   size?: number;
   modified?: number;
-  content_snippet?: string;
   icon?: string;
 }
 

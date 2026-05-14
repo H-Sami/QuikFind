@@ -106,27 +106,53 @@ async fn run_indexing(
     let is_indexing = state.is_indexing.clone();
     let indexing_handle = state.indexing_handle.clone();
     let excluded = settings.excluded_patterns.clone();
-    let app_handle = app_handle.clone();
+    let app_handle2 = app_handle.clone();
+    let app_handle3 = app_handle.clone();
+    let phase2_paths = paths.clone();
 
     let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+    let progress_tx2 = progress_tx.clone();
 
     let handle = tokio::spawn(async move {
+        // Phase 1: metadata-only — fast, completes in seconds
         let indexer = indexer::Indexer::new(search_engine.clone(), db.clone());
 
-        if let Err(e) = indexer
-            .index_paths(paths.clone(), &excluded, progress_tx)
-            .await
-        {
-            error!("Indexing failed: {}", e);
+        if let Err(e) = indexer.index_paths(paths.clone(), &excluded, progress_tx).await {
+            error!("Phase 1 indexing failed: {}", e);
         }
 
+        // Phase 1 complete: emit event so frontend knows search is available
+        app_handle2
+            .emit(
+                "index-phase1-complete",
+                models::IndexStatus {
+                    is_indexing: true,
+                    files_indexed: 0,
+                    total_files: 0,
+                    progress_percent: 100.0,
+                    last_updated: chrono::Utc::now().timestamp(),
+                    errors: Vec::new(),
+                },
+            )
+            .ok();
+
+        // Start file watcher now so live changes are tracked during Phase 2
         if let Err(e) = watcher
-            .update_watched_paths(&paths, search_engine.clone(), db.clone())
+            .update_watched_paths(&phase2_paths, search_engine.clone(), db.clone())
         {
             error!("Failed to update watched paths: {}", e);
         }
 
-        is_indexing.store(false, std::sync::atomic::Ordering::Relaxed);
+        // Phase 2: content enrichment — background, does not block user
+        let se = search_engine.clone();
+        let db2 = db.clone();
+        tokio::spawn(async move {
+            let indexer2 = indexer::Indexer::new(se, db2);
+            if let Err(e) = indexer2.enrich_content(progress_tx2).await {
+                error!("Content enrichment failed: {}", e);
+            }
+            is_indexing.store(false, std::sync::atomic::Ordering::Relaxed);
+        });
     });
 
     tokio::spawn(async move {
@@ -138,7 +164,7 @@ async fn run_indexing(
                 0.0
             };
 
-            app_handle
+            app_handle3
                 .emit(
                     "index-progress",
                     IndexStatus {
@@ -153,7 +179,7 @@ async fn run_indexing(
                 .ok();
         }
 
-        app_handle
+        app_handle3
             .emit(
                 "index-progress",
                 IndexStatus {
@@ -287,9 +313,18 @@ fn setup_app(app: &mut App) -> std::result::Result<(), Box<dyn std::error::Error
         settings.indexed_paths.clone()
     };
 
+    // Initialize Rayon with one fewer thread than logical cores, leaving one for Tokio.
+    let rayon_threads = (num_cpus::get().saturating_sub(1)).max(1);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(rayon_threads)
+        .build_global()
+        .ok();
+
     let app_handle = app.handle().clone();
     tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        // Allow the Tauri window to finish rendering before Phase 1 indexing begins.
+        // Phase 1 is metadata-only and completes in seconds, so 500ms is sufficient.
+        tokio::time::sleep(Duration::from_millis(500)).await;
         let state = app_handle.state::<AppState>();
         if let Err(e) = run_indexing(initial_paths, &state, &app_handle).await {
             error!("Initial indexing failed: {}", e);

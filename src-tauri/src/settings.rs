@@ -16,6 +16,20 @@ impl SettingsDatabase {
         info!("Opening settings database at {:?}", db_path);
 
         let conn = Connection::open(&db_path).map_err(QuikFindError::Database)?;
+
+        // Performance pragmas: WAL mode + relaxed sync gives ~10x write throughput
+        // vs the default DELETE journal while remaining crash-safe.
+        conn.execute_batch(
+            "
+            PRAGMA journal_mode = WAL;
+            PRAGMA synchronous = NORMAL;
+            PRAGMA cache_size = -65536;
+            PRAGMA temp_store = MEMORY;
+            PRAGMA mmap_size = 268435456;
+            ",
+        )
+        .map_err(QuikFindError::Database)?;
+
         let db = Self {
             conn: Mutex::new(conn),
         };
@@ -164,6 +178,62 @@ impl SettingsDatabase {
         .map_err(QuikFindError::Database)?;
 
         Ok(())
+    }
+
+    /// Batch-inserts many indexed files in a single transaction.
+    /// Used by the bulk indexer to avoid one fsync per row.
+    ///
+    /// # Errors
+    /// Propagates rusqlite errors.
+    pub fn batch_record_indexed_files(
+        &self,
+        files: &[(&str, u64, i64, &str)],
+    ) -> Result<()> {
+        let conn = self.conn.lock();
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(QuikFindError::Database)?;
+        let now = chrono::Utc::now().timestamp();
+        for (path, size, modified, doc_id) in files {
+            tx.execute(
+                "INSERT INTO indexed_files (path, size, modified, doc_id, last_indexed)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(path) DO UPDATE SET
+                    size = excluded.size,
+                    modified = excluded.modified,
+                    doc_id = excluded.doc_id,
+                    last_indexed = excluded.last_indexed",
+                params![path, size, modified, doc_id, now],
+            )
+            .map_err(QuikFindError::Database)?;
+        }
+        tx.commit().map_err(QuikFindError::Database)?;
+        Ok(())
+    }
+
+    /// Returns all indexed file records: `(path, size, modified, doc_id)`.
+    /// Used by content-enrichment phase to re-visit text files.
+    ///
+    /// # Errors
+    /// Propagates rusqlite errors.
+    pub fn get_all_indexed_files(&self) -> Result<Vec<(String, u64, i64, String)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare("SELECT path, size, modified, doc_id FROM indexed_files")
+            .map_err(QuikFindError::Database)?;
+        let files = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, u64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(QuikFindError::Database)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(QuikFindError::Database)?;
+        Ok(files)
     }
 
     pub fn remove_indexed_file(&self, path: &str) -> Result<Option<String>> {

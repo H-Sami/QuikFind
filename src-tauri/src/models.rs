@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::sync::OnceLock;
-use tantivy::schema::{Schema, FAST, INDEXED, STORED, STRING, TEXT};
+use tantivy::schema::{Schema, INDEXED, STORED, STRING, TEXT};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SearchResult {
@@ -11,7 +12,6 @@ pub struct SearchResult {
     pub score: f32,
     pub size: Option<u64>,
     pub modified: Option<i64>,
-    pub content_snippet: Option<String>,
     pub icon: Option<String>,
 }
 
@@ -154,7 +154,9 @@ pub fn schema() -> &'static Schema {
 fn build_tantivy_schema() -> Schema {
     let mut builder = Schema::builder();
     builder.add_text_field("path", TEXT | STORED);
-    builder.add_text_field("name", TEXT | STORED | FAST);
+    builder.add_text_field("name", TEXT | STORED);
+    // content is TEXT-only (not STORED): files are searchable by content keywords but
+    // no snippet is returned. Add STORED here if snippet display is required in future.
     builder.add_text_field("content", TEXT);
     builder.add_u64_field("size", INDEXED | STORED);
     builder.add_i64_field("modified", INDEXED | STORED);
@@ -173,12 +175,26 @@ pub const TEXT_EXTENSIONS: &[&str] = &[
     "vue", "svelte", "astro", "mjs", "cjs", "mts", "cts",
 ];
 
+static EXT_SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
+
+/// Returns `true` if the file at `path` has a text extension or is a known
+/// extension-less text filename (e.g., `Makefile`, `Dockerfile`).
 #[must_use]
 pub fn is_text_extension(path: &str) -> bool {
-    let lower = path.to_lowercase();
-    TEXT_EXTENSIONS
-        .iter()
-        .any(|ext| lower.ends_with(&format!(".{ext}")) || lower.ends_with(ext))
+    let ext_set = EXT_SET.get_or_init(|| TEXT_EXTENSIONS.iter().copied().collect());
+    let p = std::path::Path::new(path);
+
+    if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+        if ext_set.contains(ext.to_lowercase().as_str()) {
+            return true;
+        }
+    }
+
+    if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+        return ext_set.contains(name.to_lowercase().as_str());
+    }
+
+    false
 }
 
 #[must_use]

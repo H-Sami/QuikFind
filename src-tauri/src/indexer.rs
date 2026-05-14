@@ -14,8 +14,23 @@ use tokio::sync::mpsc;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
-const COMMIT_BATCH_SIZE: usize = 4_000;
-const MAX_BINARY_SKIP_SIZE: u64 = 512 * 1_024;
+/// Controls whether file content is read during indexing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexMode {
+    /// Index only path, name, size, mtime, kind. No content extraction.
+    MetadataOnly,
+    /// Extract and index text content for text-extension files.
+    ContentEnrichment,
+}
+
+/// Files per streaming chunk. Balances memory (~80 MB peak) against traversal latency.
+const CHUNK_SIZE: usize = 20_000;
+
+/// Tantivy is committed every this many chunks (~60k docs). Fewer commits = fewer
+/// segment flushes = faster indexing. Final commit always happens at end of traversal.
+const COMMITS_PER_FLUSH: u32 = 3;
+
+/// Progress events are throttled to this interval to avoid flooding the IPC channel.
 const PROGRESS_INTERVAL_MS: u64 = 500;
 
 struct IndexingContext<'a> {
@@ -37,6 +52,12 @@ impl Indexer {
         Self { search_engine, db }
     }
 
+    /// Phase 1: metadata-only indexing. Streams directory entries directly into the processing
+    /// pipeline in chunks of [`CHUNK_SIZE`] without collecting the full tree into memory.
+    /// When complete, the searcher is reloaded so results are immediately searchable.
+    ///
+    /// # Errors
+    /// Returns an error if the glob set cannot be built.
     pub async fn index_paths(
         &self,
         paths: Vec<String>,
@@ -71,15 +92,17 @@ impl Indexer {
             })
             .ok();
 
-        for path_str in &paths {
-            let path = Path::new(path_str);
+        let mut chunks_since_commit = 0u32;
+
+        for path_str in prioritize_paths(paths) {
+            let path = Path::new(&path_str);
             if !path.exists() {
                 warn!("Index path does not exist: {}", path_str);
                 continue;
             }
 
             if path.is_file() {
-                if let Err(e) = self.index_file(path, ctx.exclude_set, ctx.files_indexed)
+                if let Err(e) = self.index_file(path, ctx.exclude_set, ctx.files_indexed, IndexMode::MetadataOnly)
                 {
                     error!("Failed to index file {}: {}", path_str, e);
                 }
@@ -87,18 +110,38 @@ impl Indexer {
                 continue;
             }
 
-            let entries: Vec<_> = WalkDir::new(path)
+            // Streaming traversal — no .collect() on the walker
+            let mut chunk = Vec::with_capacity(CHUNK_SIZE);
+            for entry in WalkDir::new(path)
                 .skip_hidden(false)
                 .follow_links(false)
                 .into_iter()
-                .filter_map(std::result::Result::ok)
-                .collect();
+            {
+                let Ok(entry) = entry else { continue };
+                let entry_path = entry.path();
+                if is_excluded(&entry_path, ctx.exclude_set) {
+                    continue;
+                }
+                if entry.metadata().is_err() { continue; }
+                // All files pass — binaries are indexed by name; only content extraction is gated.
 
-            total_files.fetch_add(entries.len() as u64, Ordering::Relaxed);
+                total_files.fetch_add(1, Ordering::Relaxed);
+                chunk.push(entry);
 
-            self.process_entries_chunks(&entries, &ctx).await;
+                if chunk.len() == CHUNK_SIZE {
+                    let batch = std::mem::take(&mut chunk);
+                    self.process_chunk(&batch, &ctx, &mut chunks_since_commit, IndexMode::MetadataOnly)
+                        .await;
+                }
+            }
+            if !chunk.is_empty() {
+                self.process_chunk(&chunk, &ctx, &mut chunks_since_commit, IndexMode::MetadataOnly)
+                    .await;
+            }
         }
 
+        // Final commit for any remaining uncommitted chunks
+        self.search_engine.commit().ok();
         self.search_engine.finish_batch_index().await?;
 
         let elapsed = start.elapsed();
@@ -121,87 +164,196 @@ impl Indexer {
         Ok(())
     }
 
-    async fn process_entries_chunks(
+    /// Processes a single chunk of directory entries: parallel entry building, Tantivy indexing,
+    /// batch SQLite writes, and periodic Tantivy commits.
+    async fn process_chunk(
         &self,
-        entries: &[jwalk::DirEntry<((), ())>],
+        chunk: &[jwalk::DirEntry<((), ())>],
         ctx: &IndexingContext<'_>,
+        chunks_since_commit: &mut u32,
+        mode: IndexMode,
     ) {
-        for chunk in entries.chunks(COMMIT_BATCH_SIZE) {
-            // Phase 1: CPU-parallel processing (no lock held)
-            let file_entries: Vec<_> = chunk
-                .par_iter()
-                .filter_map(|entry| {
-                    let path = entry.path();
-                    if is_excluded(&path, ctx.exclude_set) { return None; }
-                    let Ok(meta) = entry.metadata() else { return None; };
-                    if meta.is_file()
-                        && meta.len() > MAX_BINARY_SKIP_SIZE
-                        && !is_text_extension(&path.to_string_lossy())
-                    { return None; }
-                    process_entry(entry).ok()
-                })
+        // Phase 1: CPU-parallel processing (no lock held)
+        let file_entries: Vec<_> = chunk
+            .par_iter()
+            .filter_map(|entry| {
+                entry.metadata().ok()?;
+                process_entry(entry, mode).ok()
+            })
+            .collect();
+
+        // Phase 2: Index documents into Tantivy (in-memory, no DB)
+        for fe in &file_entries {
+            match self.search_engine.index_document(fe) {
+                Ok(()) => {
+                    ctx.files_indexed.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => ctx.errors.lock().push(format!("{}: {e}", fe.path)),
+            }
+        }
+
+        // Phase 3: Single transaction for all DB writes
+        {
+            let db = self.db.read().await;
+            let doc_ids: Vec<String> = file_entries
+                .iter()
+                .map(|fe| compute_file_id(&fe.path, fe.size, fe.modified))
                 .collect();
+            let batch: Vec<_> = file_entries
+                .iter()
+                .zip(doc_ids.iter())
+                .map(|(fe, doc_id)| (fe.path.as_str(), fe.size, fe.modified, doc_id.as_str()))
+                .collect();
+            db.batch_record_indexed_files(&batch).ok();
+        }
 
-            // Phase 2: Index documents into Tantivy (in-memory, no DB)
-            let mut indexed = Vec::with_capacity(file_entries.len());
-            for fe in &file_entries {
-                match self.search_engine.index_document(fe) {
-                    Ok(()) => {
-                        indexed.push(fe);
-                        ctx.files_indexed.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Err(e) => ctx.errors.lock().push(format!("{}: {e}", fe.path)),
-                }
-            }
+        // Periodic Tantivy commit
+        *chunks_since_commit += 1;
+        if *chunks_since_commit >= COMMITS_PER_FLUSH {
+            self.search_engine.commit().ok();
+            *chunks_since_commit = 0;
+        }
 
-            // Phase 3: Single lock acquisition for all DB writes
-            {
-                let db = self.db.read().await;
-                for fe in &indexed {
-                    let doc_id = compute_file_id(&fe.path, fe.size, fe.modified);
-                    db.record_indexed_file(&fe.path, fe.size, fe.modified, &doc_id).ok();
-                }
-            }
-
-            // Commit Tantivy every COMMIT_BATCH_SIZE docs
-            let indexed_count = ctx.files_indexed.load(Ordering::Relaxed);
-            if indexed_count % (COMMIT_BATCH_SIZE as u64) < indexed.len() as u64 {
-                self.search_engine.commit().ok();
-            }
-
-            // Throttled progress reporting
-            {
-                let mut last = ctx.last_progress.lock();
-                if last.elapsed() >= Duration::from_millis(PROGRESS_INTERVAL_MS) {
-                    ctx.progress_tx.send(crate::models::IndexingProgress {
+        // Throttled progress reporting
+        {
+            let mut last = ctx.last_progress.lock();
+            if last.elapsed() >= Duration::from_millis(PROGRESS_INTERVAL_MS) {
+                ctx.progress_tx
+                    .send(crate::models::IndexingProgress {
                         files_indexed: ctx.files_indexed.load(Ordering::Relaxed),
-                        total_files:   ctx.total_files.load(Ordering::Relaxed),
-                        current_file:  indexed.last().map(|r| r.path.clone()),
-                        errors:        ctx.errors.lock().clone(),
-                    }).ok();
-                    *last = Instant::now();
-                }
+                        total_files: ctx.total_files.load(Ordering::Relaxed),
+                        current_file: file_entries.last().map(|r| r.path.clone()),
+                        errors: ctx.errors.lock().clone(),
+                    })
+                    .ok();
+                *last = Instant::now();
             }
         }
     }
 
+    /// Indexes a single file entry. Used for individual file paths passed directly (not via
+    /// directory traversal).
     fn index_file(
         &self,
         path: &Path,
         exclude_set: &GlobSet,
         files_indexed: &AtomicU64,
+        mode: IndexMode,
     ) -> Result<()> {
         if is_excluded(path, exclude_set) {
             return Ok(());
         }
 
         let metadata = std::fs::metadata(path).map_err(QuikFindError::Io)?;
-        let file_entry = build_file_entry(path, &metadata);
-    self.search_engine
-        .index_document(&file_entry)
-        .map_err(|e| QuikFindError::Generic(format!("Index doc: {e}")))?;
-    files_indexed.fetch_add(1, Ordering::Relaxed);
-    Ok(())
+        let file_entry = build_file_entry(path, &metadata, mode);
+        self.search_engine
+            .index_document(&file_entry)
+            .map_err(|e| QuikFindError::Generic(format!("Index doc: {e}")))?;
+        files_indexed.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Phase 2: content enrichment. Reads all already-indexed paths from SQLite, filters to
+    /// text files, re-extracts content, and replaces the Tantivy documents so that content
+    /// becomes searchable. Runs as a background task and does not block the user.
+    ///
+    /// # Errors
+    /// Returns an error if database queries or Tantivy operations fail.
+    pub async fn enrich_content(
+        &self,
+        progress_tx: mpsc::UnboundedSender<crate::models::IndexingProgress>,
+    ) -> Result<()> {
+        let all_files = {
+            let db = self.db.read().await;
+            db.get_all_indexed_files()
+                .map_err(|e| QuikFindError::Generic(format!("DB query: {e}")))? // REASON: error type is String; .to_string() would apply to the String itself
+        };
+
+        // Filter to text-extension files only
+        let text_files: Vec<_> = all_files
+            .into_iter()
+            .filter(|(path, _, _, _)| is_text_extension(path))
+            .collect();
+
+        if text_files.is_empty() {
+            info!("No text files to enrich");
+            return Ok(());
+        }
+
+        info!("Enriching content for {} text files", text_files.len());
+
+        let total = text_files.len() as u64;
+        let files_indexed = AtomicU64::new(0);
+        let errors = parking_lot::Mutex::new(Vec::<String>::new());
+        let last_progress = parking_lot::Mutex::new(Instant::now());
+        let mut chunks_since_commit = 0u32;
+
+        for chunk in text_files.chunks(CHUNK_SIZE) {
+            // Parallel content extraction
+            let entries: Vec<_> = chunk
+                .par_iter()
+                .filter_map(|(path, _, _, _)| {
+                    let p = Path::new(path);
+                    let meta = std::fs::metadata(p).ok()?;
+                    let entry = build_file_entry(p, &meta, IndexMode::ContentEnrichment);
+                    // Only keep files where content was actually extracted
+                    if entry.content.is_some() {
+                        Some(entry)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            // Delete old + add new Tantivy documents
+            for entry in &entries {
+                if let Err(e) = self.search_engine.update_document(entry) {
+                    errors.lock().push(format!("{}: {e}", entry.path));
+                }
+                files_indexed.fetch_add(1, Ordering::Relaxed);
+            }
+
+            // Batch-update SQLite doc_ids (may have changed if file metadata changed)
+            {
+                let db = self.db.read().await;
+                let doc_ids: Vec<String> = entries
+                    .iter()
+                    .map(|fe| compute_file_id(&fe.path, fe.size, fe.modified))
+                    .collect();
+                let batch: Vec<_> = entries
+                    .iter()
+                    .zip(doc_ids.iter())
+                    .map(|(fe, doc_id)| (fe.path.as_str(), fe.size, fe.modified, doc_id.as_str()))
+                    .collect();
+                db.batch_record_indexed_files(&batch).ok();
+            }
+
+            chunks_since_commit += 1;
+            if chunks_since_commit >= COMMITS_PER_FLUSH {
+                self.search_engine.commit().ok();
+                chunks_since_commit = 0;
+            }
+
+            // Throttled progress
+            {
+                let mut last = last_progress.lock();
+                if last.elapsed() >= Duration::from_millis(PROGRESS_INTERVAL_MS) {
+                    progress_tx
+                        .send(crate::models::IndexingProgress {
+                            files_indexed: files_indexed.load(Ordering::Relaxed),
+                            total_files: total,
+                            current_file: entries.last().map(|r| r.path.clone()),
+                            errors: errors.lock().clone(),
+                        })
+                        .ok();
+                    *last = Instant::now();
+                }
+            }
+        }
+
+        self.search_engine.commit().ok();
+        info!("Content enrichment complete for {} files", total);
+        Ok(())
     }
 }
 
@@ -236,7 +388,34 @@ fn is_excluded(path: &Path, exclude_set: &GlobSet) -> bool {
     false
 }
 
-pub(crate) fn build_file_entry(path: &Path, metadata: &std::fs::Metadata) -> FileEntry {
+/// Reorders paths so that user-priority directories (Desktop, Documents, Downloads, etc.)
+/// appear first. This lets the user search common locations while the rest of the drive
+/// is still being indexed.
+fn prioritize_paths(paths: Vec<String>) -> Vec<String> {
+    const PRIORITY: &[&str] = &[
+        "Desktop", "Documents", "Downloads", "Pictures", "Music", "Videos",
+    ];
+    let (mut first, rest): (Vec<_>, Vec<_>) = paths.into_iter().partition(|p| {
+        std::path::Path::new(p).components().any(|c| {
+            c.as_os_str()
+                .to_str()
+                .is_some_and(|s| PRIORITY.contains(&s))
+        })
+    });
+    first.extend(rest);
+    first
+}
+
+/// Builds a [`FileEntry`] from a path and its metadata.
+///
+/// When `mode` is [`IndexMode::MetadataOnly`], `content` is always `None`.
+/// When `mode` is [`IndexMode::ContentEnrichment`], text content is extracted for
+/// text-extension files.
+pub(crate) fn build_file_entry(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    mode: IndexMode,
+) -> FileEntry {
     let file_type = metadata.file_type();
     let kind = if file_type.is_dir() {
         ResultKind::Folder
@@ -262,7 +441,10 @@ pub(crate) fn build_file_entry(path: &Path, metadata: &std::fs::Metadata) -> Fil
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
 
-    let content = if file_type.is_file() && is_text_extension(&path.to_string_lossy()) {
+    let content = if mode == IndexMode::ContentEnrichment
+        && file_type.is_file()
+        && is_text_extension(&path.to_string_lossy())
+    {
         extract_text_content(path)
     } else {
         None
@@ -278,26 +460,41 @@ pub(crate) fn build_file_entry(path: &Path, metadata: &std::fs::Metadata) -> Fil
     }
 }
 
-fn process_entry(entry: &jwalk::DirEntry<((), ())>) -> Result<FileEntry> {
+fn process_entry(
+    entry: &jwalk::DirEntry<((), ())>,
+    mode: IndexMode,
+) -> Result<FileEntry> {
     let path = entry.path();
     let metadata = entry
         .metadata()
         .map_err(|e| QuikFindError::Generic(format!("Metadata: {e}")))?;
-    Ok(build_file_entry(&path, &metadata))
+    Ok(build_file_entry(&path, &metadata, mode))
 }
 
+/// Reads up to 50 KB of text from a file, returning `None` if the file is binary
+/// (detected via a fast 512-byte null-byte probe) or too large (>500 KB).
 #[must_use]
 pub fn extract_text_content(path: &Path) -> Option<String> {
     const MAX_CONTENT_SIZE: u64 = 50 * 1024;
+    const MAX_FILE_SIZE: u64 = 500 * 1024;
 
     let metadata = std::fs::metadata(path).ok()?;
-    if metadata.len() > MAX_CONTENT_SIZE * 10 {
+    if metadata.len() > MAX_FILE_SIZE {
         return None;
     }
 
-    let read_size = metadata.len().min(MAX_CONTENT_SIZE);
+    // Fast binary detection: read first 512 bytes and check for null byte
+    let mut probe = [0u8; 512];
+    let mut file = std::fs::File::open(path).ok()?;
+    let n = file.read(&mut probe).ok()?;
+    if probe[..n].contains(&0) {
+        return None;
+    }
+    // Reopen — we consumed the probe bytes from the first handle
+    drop(file);
     let file = std::fs::File::open(path).ok()?;
 
+    let read_size = metadata.len().min(MAX_CONTENT_SIZE);
     let mut buf = Vec::with_capacity(read_size as usize);
     file.take(read_size).read_to_end(&mut buf).ok()?;
 

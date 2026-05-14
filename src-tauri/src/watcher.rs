@@ -128,7 +128,7 @@ async fn upsert_file(
         search_engine.delete_document(&old_doc_id).ok();
     }
 
-    let entry = build_file_entry(path, &metadata);
+    let entry = build_file_entry(path, &metadata, crate::indexer::IndexMode::ContentEnrichment);
     search_engine.index_document(&entry)?;
 
     let doc_id = compute_file_id(&entry.path, entry.size, entry.modified);

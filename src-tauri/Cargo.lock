@@ -3240,7 +3240,7 @@ dependencies = [
 
 [[package]]
 name = "quikfind"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "blake3",
  "chrono",
@@ -3251,7 +3251,7 @@ dependencies = [
  "lru",
  "notify",
  "nucleo",
- "once_cell",
+ "num_cpus",
  "open",
  "parking_lot",
  "rayon",

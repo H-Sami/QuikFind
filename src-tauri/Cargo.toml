@@ -1,6 +1,6 @@
 [package]
 name = "quikfind"
-version = "1.0.1"
+version = "1.0.2"
 description = "Blazing-fast private desktop search & launcher"
 authors = ["QuikFind Team"]
 edition = "2021"
@@ -64,7 +64,7 @@ lru = "0.12"
 parking_lot = "0.12"
 chrono = "0.4"
 uuid = { version = "1", features = ["v4"] }
-once_cell = "1"
+num_cpus = "1"
 
 [dev-dependencies]
 criterion = { version = "0.5" }
