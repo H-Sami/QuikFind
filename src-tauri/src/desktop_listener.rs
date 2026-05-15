@@ -51,7 +51,11 @@ impl DesktopListener {
                     return;
                 }
                 if let Some(ch) = event_name_to_char(event.name.as_deref()) {
-                    let _ = app.emit("desktop-key", ch.to_string());
+                    // rdev::listen observes the key after Windows has accepted it; unlike
+                    // rdev::grab, it cannot consume the original desktop key event.
+                    if let Err(err) = app.emit("desktop-key", ch.to_string()) {
+                        error!("Failed to emit desktop-key event: {}", err);
+                    }
                 }
             };
 
@@ -95,7 +99,11 @@ fn update_modifiers(modifiers: &parking_lot::Mutex<ModifierState>, event_type: &
 
 fn is_quikfind_visible(app: &AppHandle) -> bool {
     app.get_webview_window("main")
-        .and_then(|w| w.is_visible().ok())
+        .map(|w| {
+            let visible = w.is_visible().unwrap_or(false);
+            let minimized = w.is_minimized().unwrap_or(false);
+            visible && !minimized
+        })
         .unwrap_or(false)
 }
 

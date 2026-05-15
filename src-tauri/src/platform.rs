@@ -28,7 +28,10 @@ pub(crate) fn is_on_desktop() -> bool {
         }
 
         let class_name = String::from_utf16_lossy(&class_name[..len as usize]);
-        class_name == "Progman" || class_name == "WorkerW"
+        matches!(
+            class_name.as_str(),
+            "Progman" | "WorkerW" | "SHELLDLL_DefView" | "SysListView32"
+        )
     }
 }
 

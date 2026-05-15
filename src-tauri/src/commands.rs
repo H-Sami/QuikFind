@@ -16,7 +16,7 @@ use std::time::Instant;
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_global_shortcut::Shortcut;
 use tokio::sync::{Mutex, RwLock};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 pub struct AppState {
     pub search_engine: Arc<SearchEngine>,
@@ -41,34 +41,41 @@ pub async fn search(
     let settings = state.settings.read().await.clone();
     let effective_limit = limit.min(settings.max_results);
     let use_cache = !state.indexing.is_active().await;
+    let trimmed_query = query.trim();
+
+    if trimmed_query.is_empty() {
+        #[allow(clippy::cast_possible_truncation)]
+        let query_time_ms = start.elapsed().as_millis() as u64;
+        return Ok(SearchResults {
+            results: Vec::new(),
+            total: 0,
+            query_time_ms,
+        });
+    }
+
+    let fetch_limit = offset.saturating_add(effective_limit).max(effective_limit);
+    let fetch_cap = settings.max_results.max(fetch_limit);
 
     let mut file_results = state
         .search_engine
         .perform_search(
             &query,
-            effective_limit,
-            offset,
-            settings.max_results,
+            fetch_limit,
+            0,
+            fetch_cap,
             settings.enable_content_search,
             use_cache,
         )
         .await
         .map_err(|e| e.to_string())?;
 
-    let app_results = if query.trim().is_empty() {
-        state.app_scanner.cached_apps().await
-    } else {
-        state.app_scanner.search_apps(&query).await
-    }
-    .map_err(|e| e.to_string())?;
+    let app_results = state
+        .app_scanner
+        .search_apps(&query)
+        .await
+        .map_err(|e| e.to_string())?;
 
-    let merged = merge_results(
-        file_results.results,
-        app_results,
-        query.trim().is_empty(),
-        effective_limit,
-        offset,
-    );
+    let merged = merge_results(file_results.results, app_results, effective_limit, offset);
 
     #[allow(clippy::cast_possible_truncation)]
     let query_time_ms = start.elapsed().as_millis() as u64;
@@ -115,12 +122,20 @@ pub async fn start_indexing(
 ) -> Result<(), String> {
     let settings = state.settings.read().await.clone();
     let actual_paths = resolve_index_paths(paths, &settings);
+    let request = {
+        let db = state.db.read().await;
+        if db.index_needs_rebuild().map_err(|e| e.to_string())? {
+            IndexRequest::Rebuild
+        } else {
+            IndexRequest::Incremental
+        }
+    };
 
     state
         .indexing
         .start(IndexingJob {
             paths: actual_paths,
-            request: IndexRequest::Incremental,
+            request,
             settings,
             app_handle,
             search_engine: state.search_engine.clone(),
@@ -175,7 +190,11 @@ pub async fn update_settings(
     if settings.hotkey != previous.hotkey {
         if let Err(err) = crate::hotkey::register_hotkey(&app_handle, &settings.hotkey, &state) {
             if settings.launch_on_startup != previous.launch_on_startup {
-                crate::set_autostart(previous.launch_on_startup, &app_handle).ok();
+                if let Err(rollback_err) =
+                    crate::set_autostart(previous.launch_on_startup, &app_handle)
+                {
+                    warn!("Failed to roll back autostart after hotkey error: {rollback_err}");
+                }
             }
             return Err(err.to_string());
         }
@@ -188,10 +207,17 @@ pub async fn update_settings(
 
     if let Err(err) = save_result {
         if settings.hotkey != previous.hotkey {
-            crate::hotkey::register_hotkey(&app_handle, &previous.hotkey, &state).ok();
+            if let Err(rollback_err) =
+                crate::hotkey::register_hotkey(&app_handle, &previous.hotkey, &state)
+            {
+                warn!("Failed to roll back hotkey after settings save error: {rollback_err}");
+            }
         }
         if settings.launch_on_startup != previous.launch_on_startup {
-            crate::set_autostart(previous.launch_on_startup, &app_handle).ok();
+            if let Err(rollback_err) = crate::set_autostart(previous.launch_on_startup, &app_handle)
+            {
+                warn!("Failed to roll back autostart after settings save error: {rollback_err}");
+            }
         }
         return Err(err.to_string());
     }
@@ -227,7 +253,9 @@ pub async fn launch_app(app_id: String, state: tauri::State<'_, AppState>) -> Re
         opened_at: chrono::Utc::now().timestamp(),
     };
     let db = state.db.read().await;
-    db.add_history(&item).ok();
+    if let Err(err) = db.add_history(&item) {
+        error!("Failed to record app launch history for {}: {}", path, err);
+    }
 
     Ok(())
 }
@@ -307,7 +335,6 @@ pub async fn get_plugins(
 fn merge_results(
     mut files: Vec<SearchResult>,
     apps: Vec<AppResult>,
-    empty_query: bool,
     limit: u32,
     offset: u32,
 ) -> SearchResults {
@@ -316,11 +343,7 @@ fn merge_results(
         path: app.path,
         name: app.name,
         kind: ResultKind::App,
-        score: if empty_query {
-            1.0 + app.score
-        } else {
-            1000.0 + app.score
-        },
+        score: 1000.0 + app.score,
         size: None,
         modified: None,
         icon: app.icon,
@@ -398,5 +421,50 @@ async fn record_history_for_path(db: &RwLock<SettingsDatabase>, path: &str) {
     };
 
     let db = db.read().await;
-    db.add_history(&item).ok();
+    if let Err(err) = db.add_history(&item) {
+        error!("Failed to record history for {}: {}", path, err);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file_result(id: &str, score: f32) -> SearchResult {
+        SearchResult {
+            id: id.to_string(),
+            path: format!("C:/files/{id}.txt"),
+            name: format!("{id}.txt"),
+            kind: ResultKind::File,
+            score,
+            size: None,
+            modified: None,
+            icon: None,
+        }
+    }
+
+    fn app_result(id: &str, score: f32) -> AppResult {
+        AppResult {
+            id: id.to_string(),
+            path: format!("C:/apps/{id}.lnk"),
+            name: id.to_string(),
+            icon: None,
+            score,
+        }
+    }
+
+    #[test]
+    fn merged_results_apply_offset_once_after_app_file_merge() {
+        let merged = merge_results(
+            vec![file_result("file-a", 20.0), file_result("file-b", 10.0)],
+            vec![app_result("app-a", 5.0), app_result("app-b", 4.0)],
+            2,
+            1,
+        );
+
+        assert_eq!(merged.total, 4);
+        assert_eq!(merged.results.len(), 2);
+        assert_eq!(merged.results[0].id, "app-b");
+        assert_eq!(merged.results[1].id, "file-a");
+    }
 }

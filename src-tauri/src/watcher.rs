@@ -98,45 +98,53 @@ fn enqueue_deduped(
 }
 
 fn classify_event(event: &Event, exclude_set: &GlobSet) -> WatcherChanges {
-    let paths: Vec<PathBuf> = event
-        .paths
-        .iter()
-        .filter(|path| !is_excluded(path, exclude_set))
-        .cloned()
-        .collect();
-
     let mut changes = WatcherChanges::default();
     match &event.kind {
         EventKind::Create(_) => {
             changes
                 .upserts
-                .extend(paths.into_iter().filter(|path| is_indexable_file(path)));
+                .extend(included_paths(event, exclude_set).filter(|path| is_indexable_file(path)));
         }
-        EventKind::Modify(ModifyKind::Name(RenameMode::Both)) if paths.len() >= 2 => {
-            changes.removes.push(paths[0].clone());
-            if is_indexable_file(&paths[1]) {
-                changes.upserts.push(paths[1].clone());
+        EventKind::Modify(ModifyKind::Name(RenameMode::Both)) if event.paths.len() >= 2 => {
+            let old_path = &event.paths[0];
+            let new_path = &event.paths[1];
+            if !is_excluded(old_path, exclude_set) {
+                changes.removes.push(old_path.clone());
+            }
+            if !is_excluded(new_path, exclude_set) && is_indexable_file(new_path) {
+                changes.upserts.push(new_path.clone());
             }
         }
         EventKind::Modify(ModifyKind::Name(RenameMode::From)) => {
-            changes.removes.extend(paths);
+            changes.removes.extend(included_paths(event, exclude_set));
         }
         EventKind::Modify(ModifyKind::Name(RenameMode::To)) => {
             changes
                 .upserts
-                .extend(paths.into_iter().filter(|path| is_indexable_file(path)));
+                .extend(included_paths(event, exclude_set).filter(|path| is_indexable_file(path)));
         }
         EventKind::Modify(_) => {
             changes
                 .upserts
-                .extend(paths.into_iter().filter(|path| is_indexable_file(path)));
+                .extend(included_paths(event, exclude_set).filter(|path| is_indexable_file(path)));
         }
         EventKind::Remove(_) => {
-            changes.removes.extend(paths);
+            changes.removes.extend(included_paths(event, exclude_set));
         }
         _ => {}
     }
     changes
+}
+
+fn included_paths<'a>(
+    event: &'a Event,
+    exclude_set: &'a GlobSet,
+) -> impl Iterator<Item = PathBuf> + 'a {
+    event
+        .paths
+        .iter()
+        .filter(|path| !is_excluded(path, exclude_set))
+        .cloned()
 }
 
 fn is_indexable_file(path: &Path) -> bool {
@@ -392,6 +400,51 @@ mod tests {
         let changes = classify_event(&event, &empty_exclusions());
 
         assert_eq!(changes.removes, vec![old]);
+        assert_eq!(changes.upserts, vec![new]);
+
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[test]
+    fn rename_from_included_to_excluded_removes_old_path() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "quikfind-rename-excluded-test-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(temp_dir.join("node_modules")).unwrap();
+        let old = temp_dir.join("old.txt");
+        let new = temp_dir.join("node_modules").join("old.txt");
+        let exclusions = build_glob_set(&["**/node_modules/**".to_string()]).unwrap();
+        let event = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+            .add_path(old.clone())
+            .add_path(new);
+
+        let changes = classify_event(&event, &exclusions);
+
+        assert_eq!(changes.removes, vec![old]);
+        assert!(changes.upserts.is_empty());
+
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[test]
+    fn rename_from_excluded_to_included_upserts_new_path() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "quikfind-rename-included-test-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(temp_dir.join("node_modules")).unwrap();
+        let old = temp_dir.join("node_modules").join("new.txt");
+        let new = temp_dir.join("new.txt");
+        std::fs::write(&new, "hello").unwrap();
+        let exclusions = build_glob_set(&["**/node_modules/**".to_string()]).unwrap();
+        let event = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+            .add_path(old)
+            .add_path(new.clone());
+
+        let changes = classify_event(&event, &exclusions);
+
+        assert!(changes.removes.is_empty());
         assert_eq!(changes.upserts, vec![new]);
 
         std::fs::remove_dir_all(temp_dir).unwrap();

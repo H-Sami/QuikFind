@@ -80,8 +80,8 @@ impl IndexingSupervisor {
     }
 
     pub async fn start(self: &Arc<Self>, job: IndexingJob) -> Result<()> {
-        if job.request == IndexRequest::Rebuild {
-            self.stop(job.search_engine.clone()).await.ok();
+        if job.request == IndexRequest::Rebuild && self.is_active().await {
+            self.stop(job.search_engine.clone()).await?;
         }
 
         let mut handle_guard = self.handle.lock().await;
@@ -99,14 +99,29 @@ impl IndexingSupervisor {
             db_guard.clear_indexed_files()?;
         }
 
+        {
+            let db_guard = job.db.read().await;
+            db_guard.mark_content_enrichment_pending()?;
+        }
+
         let cancel = Arc::new(AtomicBool::new(false));
         *self.cancel.lock().await = Some(cancel.clone());
 
         let supervisor = self.clone();
         let task = tokio::spawn(async move {
-            let result = run_indexing_lifecycle(supervisor.clone(), job.clone(), cancel).await;
+            let mut result = run_indexing_lifecycle(supervisor.clone(), job.clone(), cancel).await;
 
-            if let Err(err) = result {
+            if result.is_ok() {
+                let complete_result = {
+                    let db_guard = job.db.read().await;
+                    db_guard.mark_index_lifecycle_complete()
+                };
+                if let Err(err) = complete_result {
+                    result = Err(err);
+                }
+            }
+
+            if let Err(err) = &result {
                 if !matches!(err, QuikFindError::Cancelled) {
                     error!("Indexing failed: {}", err);
                 }
@@ -144,7 +159,7 @@ impl IndexingSupervisor {
             .await
             .map_err(|e| QuikFindError::Generic(format!("Indexing task join failed: {e}")))?;
 
-        search_engine.commit_reload_invalidate().await.ok();
+        search_engine.commit_reload_invalidate().await?;
         *self.cancel.lock().await = None;
         info!("Indexing stopped by user");
         Ok(())

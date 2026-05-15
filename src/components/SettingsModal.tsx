@@ -38,6 +38,55 @@ function formatShortcutForDisplay(keys: string): React.ReactNode {
 
 const modifierKeys = new Set(['Control', 'Shift', 'Alt', 'Meta']);
 
+const globalCodeAliases: Record<string, string> = {
+  Space: 'Space',
+  Comma: 'Comma',
+  Period: 'Period',
+  Minus: 'Minus',
+  Equal: 'Equal',
+  Slash: 'Slash',
+  Backquote: 'Backquote',
+  BracketLeft: 'BracketLeft',
+  BracketRight: 'BracketRight',
+  Backslash: 'Backslash',
+  Semicolon: 'Semicolon',
+  Quote: 'Quote',
+  Enter: 'Enter',
+  Tab: 'Tab',
+  Backspace: 'Backspace',
+  Delete: 'Delete',
+  Insert: 'Insert',
+  Home: 'Home',
+  End: 'End',
+  PageUp: 'PageUp',
+  PageDown: 'PageDown',
+  ArrowUp: 'ArrowUp',
+  ArrowDown: 'ArrowDown',
+  ArrowLeft: 'ArrowLeft',
+  ArrowRight: 'ArrowRight',
+  Escape: 'Escape',
+  NumpadAdd: 'NumpadAdd',
+  NumpadSubtract: 'NumpadSubtract',
+  NumpadMultiply: 'NumpadMultiply',
+  NumpadDivide: 'NumpadDivide',
+  NumpadDecimal: 'NumpadDecimal',
+  NumpadEnter: 'NumpadEnter',
+};
+
+function shortcutKeyFromEvent(e: KeyboardEvent, globalHotkey: boolean): string | null {
+  if (!globalHotkey) {
+    if (e.key === ' ') return 'Space';
+    if (e.key.length === 1) return e.key.toUpperCase();
+    return e.key === 'Unidentified' ? null : e.key;
+  }
+
+  if (/^Key[A-Z]$/.test(e.code)) return e.code.slice(3);
+  if (/^Digit[0-9]$/.test(e.code)) return e.code.slice(5);
+  if (/^F([1-9]|1[0-9]|2[0-4])$/.test(e.code)) return e.code;
+  if (/^Numpad[0-9]$/.test(e.code)) return e.code;
+  return globalCodeAliases[e.code] ?? null;
+}
+
 function shortcutFromEvent(e: KeyboardEvent, globalHotkey: boolean): string | null {
   if (modifierKeys.has(e.key)) return null;
 
@@ -46,11 +95,8 @@ function shortcutFromEvent(e: KeyboardEvent, globalHotkey: boolean): string | nu
   if (e.shiftKey) mods.push('Shift');
   if (e.altKey) mods.push('Alt');
 
-  let key = e.key;
-  if (key === ' ') key = 'Space';
-  if (key === 'ArrowUp') key = 'ArrowUp';
-  if (key === 'ArrowDown') key = 'ArrowDown';
-  if (key.length === 1) key = key.toUpperCase();
+  const key = shortcutKeyFromEvent(e, globalHotkey);
+  if (!key) return null;
   if (globalHotkey && mods.length === 0) return null;
 
   return [...mods, key].join('+');
@@ -74,6 +120,23 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, initialT
   const [indexStatus, setIndexStatus] = useState<IndexStatus | null>(null);
   const [isReindexing, setIsReindexing] = useState(false);
   const modalRef = useRef<HTMLDivElement>(null);
+
+  const persistHotkey = useCallback(async (newHotkey: string) => {
+    const previousHotkey = useStore.getState().settings.hotkey;
+    setError(null);
+    try {
+      await updateSettings({ hotkey: newHotkey });
+      await loadSettings();
+      const savedHotkey = useStore.getState().settings.hotkey;
+      setLocalSettings(prev => ({ ...prev, hotkey: savedHotkey }));
+      showToast(`Hotkey saved to ${savedHotkey}`, 'success');
+    } catch (err) {
+      const message = String(err);
+      setLocalSettings(prev => ({ ...prev, hotkey: previousHotkey }));
+      setError(message);
+      showToast(message, 'error');
+    }
+  }, [updateSettings, loadSettings, showToast]);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -153,12 +216,12 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, initialT
 
       setLocalSettings(prev => ({ ...prev, hotkey: newHotkey }));
       setRecordingHotkey(false);
-      showToast(`Hotkey set to ${newHotkey}. Save to apply.`, 'info');
+      void persistHotkey(newHotkey);
     };
 
     window.addEventListener('keydown', handleKeyDown, true);
     return () => window.removeEventListener('keydown', handleKeyDown, true);
-  }, [recordingHotkey, showToast]);
+  }, [recordingHotkey, persistHotkey, showToast]);
 
   const handleReindex = useCallback(async () => {
     setIsReindexing(true);
@@ -311,8 +374,7 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, initialT
                       onChange={(checked) => setLocalSettings(prev => ({ ...prev, enable_content_search: checked }))}
                     />
                     <ToggleRow
-                      title="Type to Search"
-                      subtitle="Open QuikFind from desktop keystrokes"
+                      title="Desktop typing"
                       checked={localSettings.enable_type_to_search}
                       onChange={(checked) => setLocalSettings(prev => ({ ...prev, enable_type_to_search: checked }))}
                     />
@@ -523,7 +585,7 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, initialT
 
 interface ToggleRowProps {
   title: string;
-  subtitle: string;
+  subtitle?: string;
   checked: boolean;
   onChange: (checked: boolean) => void;
 }
@@ -532,7 +594,7 @@ const ToggleRow: React.FC<ToggleRowProps> = ({ title, subtitle, checked, onChang
   <div className="flex items-center justify-between py-2">
     <div>
       <div className="text-xs text-[var(--text-primary)]">{title}</div>
-      <div className="text-[11px] text-[var(--text-tertiary)]">{subtitle}</div>
+      {subtitle && <div className="text-[11px] text-[var(--text-tertiary)]">{subtitle}</div>}
     </div>
     <label className="relative inline-flex items-center cursor-pointer">
       <input

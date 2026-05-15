@@ -1,6 +1,6 @@
 [package]
 name = "quikfind"
-version = "1.0.2"
+version = "1.0.3"
 description = "Blazing-fast private desktop search & launcher"
 authors = ["QuikFind Team"]
 edition = "2021"

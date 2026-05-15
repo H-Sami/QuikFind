@@ -2,7 +2,7 @@
   "$schema": "https://schema.tauri.app/config/2",
   "identifier": "com.quikfind.app",
   "productName": "QuikFind",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "build": {
     "beforeDevCommand": "npm run dev",
     "beforeBuildCommand": "npm run build",
@@ -13,7 +13,7 @@
     "active": true,
     "targets": ["msi", "nsis"],
     "icon": ["icons/icon.ico"],
-    "copyright": "© 2026 QuikFind",
+    "copyright": "(c) 2026 QuikFind",
     "category": "Utility",
     "shortDescription": "Lightning-fast local search"
   },

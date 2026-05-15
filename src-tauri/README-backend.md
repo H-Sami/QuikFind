@@ -6,19 +6,19 @@ Rust and Tauri 2 backend for local desktop search and app launching.
 
 ```text
 src/
-├── main.rs              # Entry point
-├── lib.rs               # App setup and subsystem composition
-├── commands.rs          # Thin Tauri command handlers
-├── indexing.rs          # Single indexing lifecycle owner
-├── indexer.rs           # jwalk/rayon traversal and document construction
-├── search.rs            # Tantivy mechanics, reader reload, query cache
-├── watcher.rs           # notify-based live filesystem deltas
-├── apps.rs              # OS app scanner and launcher
-├── settings.rs          # SQLite settings, history, file metadata, app cache
-├── hotkey.rs            # Hotkey validation and atomic registration
-├── desktop_listener.rs  # Optional Type to Search listener
-├── platform.rs          # Platform helpers
-└── plugins.rs           # In-process plugin registry skeleton
+|-- main.rs              # Entry point
+|-- lib.rs               # App setup and subsystem composition
+|-- commands.rs          # Thin Tauri command handlers
+|-- indexing.rs          # Single indexing lifecycle owner
+|-- indexer.rs           # jwalk/rayon traversal and document construction
+|-- search.rs            # Tantivy mechanics, reader reload, query cache
+|-- watcher.rs           # notify-based live filesystem deltas
+|-- apps.rs              # OS app scanner and launcher
+|-- settings.rs          # SQLite settings, history, file metadata, app cache
+|-- hotkey.rs            # Hotkey validation and atomic registration
+|-- desktop_listener.rs  # Optional desktop typing listener
+|-- platform.rs          # Platform helpers
+`-- plugins.rs           # In-process plugin registry skeleton
 ```
 
 ## Indexing Lifecycle
@@ -39,17 +39,18 @@ Every index mutation that should be visible to search uses the same path: commit
 - File identity is a stable hash of normalized path.
 - Re-indexing or watcher upserts replace the document with the same stable ID.
 - Query cache keys include query, limit, offset, max-results, and content-search mode.
-- App results are cached in SQLite and merged into the main `search` command.
+- Empty or whitespace-only queries return no app or file results.
+- App results are cached in SQLite and merged into the main `search` command for non-empty queries.
 
 ## Watcher
 
-The watcher classifies notify events into upserts and removals. Delete paths are preserved even when the file no longer exists. Create, modify, remove, and rename events commit, reload, and invalidate caches when they change the index. Exclusion patterns are shared with the indexer.
+The watcher classifies notify events into upserts and removals. Delete paths are preserved even when the file no longer exists. Rename pairs are classified before exclusion filtering, so moves into excluded locations remove old indexed paths and moves out of excluded locations upsert the new file. Create, modify, remove, and rename events commit, reload, and invalidate caches when they change the index. Exclusion patterns are shared with the indexer.
 
 ## Settings and Hotkeys
 
 Settings persistence is validation-first. Hotkeys are parsed and registered before settings are saved. If registration fails, the previous hotkey remains active and settings are not persisted.
 
-Type to Search is controlled by `enable_type_to_search` and defaults to disabled. The listener starts only when enabled and emits characters only for unmodified text keypresses while the foreground window is the Windows desktop.
+The desktop typing trigger is controlled by `enable_type_to_search` and defaults to disabled. The listener starts only when enabled and emits characters only for unmodified text keypresses while the foreground window is the Windows desktop.
 
 ## Commands
 

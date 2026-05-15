@@ -187,8 +187,8 @@ fn setup_app(app: &mut App) -> std::result::Result<(), Box<dyn std::error::Error
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("quikfind");
 
-    std::fs::create_dir_all(&config_dir).ok();
-    std::fs::create_dir_all(config_dir.join("index")).ok();
+    std::fs::create_dir_all(&config_dir)?;
+    std::fs::create_dir_all(config_dir.join("index"))?;
 
     let settings = init_app_state(app, &config_dir)?;
 
@@ -221,13 +221,29 @@ fn setup_app(app: &mut App) -> std::result::Result<(), Box<dyn std::error::Error
             let db = state.db.read().await;
             db.get_indexed_file_count().unwrap_or(0)
         };
+        let needs_rebuild = {
+            let db = state.db.read().await;
+            db.index_needs_rebuild().unwrap_or(true)
+        };
+        let content_complete = {
+            let db = state.db.read().await;
+            db.content_enrichment_complete().unwrap_or(false)
+        };
 
-        if indexed_count == 0 {
+        let startup_request = if indexed_count == 0 || needs_rebuild {
+            Some(IndexRequest::Rebuild)
+        } else if !content_complete {
+            Some(IndexRequest::Incremental)
+        } else {
+            None
+        };
+
+        if let Some(request) = startup_request {
             if let Err(e) = state
                 .indexing
                 .start(IndexingJob {
-                    paths: initial_paths,
-                    request: IndexRequest::Rebuild,
+                    paths: initial_paths.clone(),
+                    request,
                     settings: launch_settings,
                     app_handle: app_handle.clone(),
                     search_engine: state.search_engine.clone(),

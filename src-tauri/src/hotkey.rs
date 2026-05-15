@@ -11,10 +11,11 @@ pub fn register_hotkey(app: &AppHandle, hotkey_str: &str, state: &AppState) -> R
 
     match shortcut {
         None => {
-            if let Some(old) = active.take() {
+            if let Some(old) = active.as_ref().copied() {
                 app.global_shortcut().unregister(old).map_err(|e| {
                     QuikFindError::Generic(format!("Failed to unregister hotkey: {e}"))
                 })?;
+                *active = None;
             }
             Ok(())
         }
@@ -26,10 +27,7 @@ pub fn register_hotkey(app: &AppHandle, hotkey_str: &str, state: &AppState) -> R
             app.global_shortcut()
                 .on_shortcut(new_shortcut, move |handle, _sc, event| {
                     if event.state == ShortcutState::Pressed {
-                        if let Some(window) = handle.get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.set_focus();
-                        }
+                        show_main_window(handle);
                     }
                 })
                 .map_err(|e| {
@@ -47,6 +45,14 @@ pub fn register_hotkey(app: &AppHandle, hotkey_str: &str, state: &AppState) -> R
             *active = Some(new_shortcut);
             Ok(())
         }
+    }
+}
+
+fn show_main_window(handle: &AppHandle) {
+    if let Some(window) = handle.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
     }
 }
 
@@ -107,5 +113,10 @@ mod tests {
     #[test]
     fn validate_hotkey_accepts_default_shortcut() {
         assert!(validate_hotkey("CmdOrCtrl+Space").unwrap().is_some());
+    }
+
+    #[test]
+    fn validate_hotkey_accepts_recorded_shortcut() {
+        assert!(validate_hotkey("Ctrl+Alt+K").unwrap().is_some());
     }
 }

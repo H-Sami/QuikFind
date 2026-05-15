@@ -117,6 +117,7 @@ impl Indexer {
                     .await
                 {
                     error!("Failed to index file {}: {}", path_str, e);
+                    return Err(e);
                 }
                 total_files.fetch_add(1, Ordering::Relaxed);
                 continue;
@@ -153,7 +154,7 @@ impl Indexer {
                         &mut chunks_since_commit,
                         IndexMode::MetadataOnly,
                     )
-                    .await;
+                    .await?;
                 }
             }
             if !chunk.is_empty() {
@@ -163,7 +164,7 @@ impl Indexer {
                     &mut chunks_since_commit,
                     IndexMode::MetadataOnly,
                 )
-                .await;
+                .await?;
             }
         }
 
@@ -197,9 +198,9 @@ impl Indexer {
         ctx: &IndexingContext<'_>,
         chunks_since_commit: &mut u32,
         mode: IndexMode,
-    ) {
+    ) -> Result<()> {
         if ctx.cancel.load(Ordering::Relaxed) {
-            return;
+            return Err(QuikFindError::Cancelled);
         }
 
         // Phase 1: CPU-parallel processing (no lock held)
@@ -212,34 +213,36 @@ impl Indexer {
             .collect();
 
         // Phase 2: Index documents into Tantivy (in-memory, no DB)
+        let mut indexed_entries = Vec::with_capacity(file_entries.len());
         for fe in &file_entries {
             match self.search_engine.index_document(fe) {
                 Ok(()) => {
                     ctx.files_indexed.fetch_add(1, Ordering::Relaxed);
+                    indexed_entries.push(fe);
                 }
                 Err(e) => ctx.errors.lock().push(format!("{}: {e}", fe.path)),
             }
         }
 
         // Phase 3: Single transaction for all DB writes
-        {
+        if !indexed_entries.is_empty() {
             let db = self.db.read().await;
-            let doc_ids: Vec<String> = file_entries
+            let doc_ids: Vec<String> = indexed_entries
                 .iter()
                 .map(|fe| compute_file_id(&fe.path))
                 .collect();
-            let batch: Vec<_> = file_entries
+            let batch: Vec<_> = indexed_entries
                 .iter()
                 .zip(doc_ids.iter())
                 .map(|(fe, doc_id)| (fe.path.as_str(), fe.size, fe.modified, doc_id.as_str()))
                 .collect();
-            db.batch_record_indexed_files(&batch).ok();
+            db.batch_record_indexed_files(&batch)?;
         }
 
         // Periodic Tantivy commit
         *chunks_since_commit += 1;
         if *chunks_since_commit >= COMMITS_PER_FLUSH {
-            self.search_engine.commit_reload_invalidate().await.ok();
+            self.search_engine.commit_reload_invalidate().await?;
             *chunks_since_commit = 0;
         }
 
@@ -258,6 +261,8 @@ impl Indexer {
                 *last = Instant::now();
             }
         }
+
+        Ok(())
     }
 
     /// Indexes a single file entry. Used for individual file paths passed directly (not via
@@ -355,29 +360,35 @@ impl Indexer {
                 .collect();
 
             // Delete old + add new Tantivy documents
+            let mut updated_entries = Vec::with_capacity(entries.len());
             for entry in &entries {
-                if let Err(e) = self.search_engine.update_document(entry) {
-                    errors.lock().push(format!("{}: {e}", entry.path));
+                match self.search_engine.update_document(entry) {
+                    Ok(()) => {
+                        files_indexed.fetch_add(1, Ordering::Relaxed);
+                        updated_entries.push(entry);
+                    }
+                    Err(e) => errors.lock().push(format!("{}: {e}", entry.path)),
                 }
-                files_indexed.fetch_add(1, Ordering::Relaxed);
             }
 
             // Batch-update SQLite doc_ids (may have changed if file metadata changed)
-            {
+            if !updated_entries.is_empty() {
                 let db = self.db.read().await;
-                let doc_ids: Vec<String> =
-                    entries.iter().map(|fe| compute_file_id(&fe.path)).collect();
-                let batch: Vec<_> = entries
+                let doc_ids: Vec<String> = updated_entries
+                    .iter()
+                    .map(|fe| compute_file_id(&fe.path))
+                    .collect();
+                let batch: Vec<_> = updated_entries
                     .iter()
                     .zip(doc_ids.iter())
                     .map(|(fe, doc_id)| (fe.path.as_str(), fe.size, fe.modified, doc_id.as_str()))
                     .collect();
-                db.batch_record_indexed_files(&batch).ok();
+                db.batch_record_indexed_files(&batch)?;
             }
 
             chunks_since_commit += 1;
             if chunks_since_commit >= COMMITS_PER_FLUSH {
-                self.search_engine.commit_reload_invalidate().await.ok();
+                self.search_engine.commit_reload_invalidate().await?;
                 chunks_since_commit = 0;
             }
 

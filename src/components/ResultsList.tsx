@@ -130,7 +130,7 @@ const ResultsList: React.FC<ResultsListProps> = ({
               Start typing to search
             </div>
             <div className="max-w-xs text-sm text-white/50 leading-relaxed">
-              Apps and files will appear here.
+              Results will appear here.
             </div>
           </div>
         </div>

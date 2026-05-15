@@ -80,10 +80,14 @@ function App() {
       const char = event.payload;
       const win = getCurrentWindow();
       const isVisible = await win.isVisible();
+      const isMinimized = await win.isMinimized();
 
-      if (isVisible) return;
+      if (isVisible && !isMinimized) return;
 
       await win.show();
+      if (isMinimized) {
+        await win.unminimize();
+      }
       await win.setFocus();
       setQuery(char);
 

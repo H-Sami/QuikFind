@@ -107,7 +107,7 @@ impl AppScanner {
         let db = self.db.read().await;
         db.clear_cached_apps()?;
         for app in &apps {
-            db.cache_app(&app.id, &app.name, &app.path, None).ok();
+            db.cache_app(&app.id, &app.name, &app.path, None)?;
         }
 
         info!(
@@ -121,8 +121,7 @@ impl AppScanner {
 }
 
 fn cached_app_rows_to_results(rows: Vec<(String, String, String)>) -> Vec<AppResult> {
-    rows
-        .into_iter()
+    rows.into_iter()
         .map(|(id, name, path)| AppResult {
             id,
             name,

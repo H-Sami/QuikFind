@@ -12,6 +12,11 @@ src-tauri/.cargo/
 *.log
 .env
 
+# Local agent handoff notes
+AGENTS.md
+ROADMAP.md
+checkpoint.md
+
 # OS generated files
 .DS_Store
 Thumbs.db

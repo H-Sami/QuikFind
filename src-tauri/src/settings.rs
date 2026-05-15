@@ -5,6 +5,10 @@ use rusqlite::{params, Connection};
 use std::path::Path;
 use tracing::info;
 
+pub const CURRENT_INDEX_FORMAT_VERSION: &str = "2";
+const INDEX_FORMAT_KEY: &str = "index_format_version";
+const CONTENT_ENRICHED_KEY: &str = "content_enrichment_complete";
+
 pub struct SettingsDatabase {
     conn: Mutex<Connection>,
 }
@@ -102,14 +106,65 @@ impl SettingsDatabase {
     }
 
     pub fn save_settings(&self, settings: &AppSettings) -> Result<()> {
-        let conn = self.conn.lock();
         let json = serde_json::to_string(settings).map_err(QuikFindError::Serialization)?;
+        self.save_setting_value("app_settings", &json)
+    }
+
+    fn get_setting_value(&self, key: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock();
+        match conn.query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            params![key],
+            |row| row.get(0),
+        ) {
+            Ok(value) => Ok(Some(value)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(QuikFindError::Database(e)),
+        }
+    }
+
+    fn save_setting_value(&self, key: &str, value: &str) -> Result<()> {
+        let conn = self.conn.lock();
         conn.execute(
-            "INSERT INTO settings (key, value) VALUES ('app_settings', ?1)
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![json],
+            params![key, value],
         )
         .map_err(QuikFindError::Database)?;
+        Ok(())
+    }
+
+    pub fn index_needs_rebuild(&self) -> Result<bool> {
+        Ok(self.get_setting_value(INDEX_FORMAT_KEY)?.as_deref()
+            != Some(CURRENT_INDEX_FORMAT_VERSION))
+    }
+
+    pub fn content_enrichment_complete(&self) -> Result<bool> {
+        Ok(self.get_setting_value(CONTENT_ENRICHED_KEY)?.as_deref() == Some("true"))
+    }
+
+    pub fn mark_content_enrichment_pending(&self) -> Result<()> {
+        self.save_setting_value(CONTENT_ENRICHED_KEY, "false")
+    }
+
+    pub fn mark_index_lifecycle_complete(&self) -> Result<()> {
+        let conn = self.conn.lock();
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(QuikFindError::Database)?;
+        tx.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![INDEX_FORMAT_KEY, CURRENT_INDEX_FORMAT_VERSION],
+        )
+        .map_err(QuikFindError::Database)?;
+        tx.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, 'true')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![CONTENT_ENRICHED_KEY],
+        )
+        .map_err(QuikFindError::Database)?;
+        tx.commit().map_err(QuikFindError::Database)?;
         Ok(())
     }
 
@@ -235,13 +290,15 @@ impl SettingsDatabase {
     pub fn remove_indexed_file(&self, path: &str) -> Result<Option<String>> {
         let conn = self.conn.lock();
 
-        let doc_id: Option<String> = conn
-            .query_row(
-                "SELECT doc_id FROM indexed_files WHERE path = ?1",
-                params![path],
-                |row| row.get(0),
-            )
-            .ok();
+        let doc_id: Option<String> = match conn.query_row(
+            "SELECT doc_id FROM indexed_files WHERE path = ?1",
+            params![path],
+            |row| row.get(0),
+        ) {
+            Ok(doc_id) => Some(doc_id),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => return Err(QuikFindError::Database(e)),
+        };
 
         conn.execute("DELETE FROM indexed_files WHERE path = ?1", params![path])
             .map_err(QuikFindError::Database)?;

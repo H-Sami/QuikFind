@@ -22,6 +22,14 @@ export function useSearch() {
   selectedIndexRef.current = selectedIndex;
 
   const performSearch = useCallback(async (searchQuery: string) => {
+    if (!searchQuery.trim()) {
+      searchIdRef.current += 1;
+      setResults([]);
+      setSelectedIndex(0);
+      setIsLoading(false);
+      return;
+    }
+
     const currentId = ++searchIdRef.current;
     setIsLoading(true);
     try {
@@ -45,6 +53,14 @@ export function useSearch() {
   }, [settings.max_results, showToast]);
 
   useEffect(() => {
+    if (!query.trim()) {
+      searchIdRef.current += 1;
+      setResults([]);
+      setSelectedIndex(0);
+      setIsLoading(false);
+      return;
+    }
+
     const delay = query.trim().length <= 3 ? SEARCH_DEBOUNCE_SHORT : SEARCH_DEBOUNCE_LONG;
     const timer = setTimeout(() => performSearch(query), delay);
     return () => clearTimeout(timer);

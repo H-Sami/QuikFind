@@ -15,7 +15,7 @@ Built with Rust, Tauri 2, React 18, TypeScript, Vite, Tailwind CSS, Tantivy, Nuc
 - Real-time file watching for create, modify, delete, and rename events
 - Glob-based exclusions shared by indexing and watching
 - Configurable global hotkey
-- Optional Type to Search, disabled by default
+- Optional desktop typing trigger, disabled by default
 - Search history recorded by the backend when items are opened
 - Query caching only when the index is stable
 - System tray integration, window state persistence, and autostart setting
@@ -52,21 +52,21 @@ cargo clippy --all-targets -- -D warnings
 
 ```text
 QuikFind/
-├── src/                  # React frontend
-├── src-tauri/src/        # Rust backend
-│   ├── lib.rs            # Tauri setup and subsystem composition
-│   ├── commands.rs       # Thin Tauri command handlers
-│   ├── indexing.rs       # Indexing supervisor and lifecycle
-│   ├── indexer.rs        # File traversal and document building
-│   ├── search.rs         # Tantivy search mechanics and query cache
-│   ├── watcher.rs        # Live filesystem deltas
-│   ├── apps.rs           # OS app scanner and launcher
-│   ├── settings.rs       # SQLite persistence
-│   ├── hotkey.rs         # Hotkey validation and registration
-│   └── desktop_listener.rs
-├── src-tauri/Cargo.toml
-├── src-tauri/tauri.conf.json
-└── package.json
+|-- src/                  # React frontend
+|-- src-tauri/src/        # Rust backend
+|   |-- lib.rs            # Tauri setup and subsystem composition
+|   |-- commands.rs       # Thin Tauri command handlers
+|   |-- indexing.rs       # Indexing supervisor and lifecycle
+|   |-- indexer.rs        # File traversal and document building
+|   |-- search.rs         # Tantivy search mechanics and query cache
+|   |-- watcher.rs        # Live filesystem deltas
+|   |-- apps.rs           # OS app scanner and launcher
+|   |-- settings.rs       # SQLite persistence
+|   |-- hotkey.rs         # Hotkey validation and registration
+|   `-- desktop_listener.rs
+|-- src-tauri/Cargo.toml
+|-- src-tauri/tauri.conf.json
+`-- package.json
 ```
 
 ## License
