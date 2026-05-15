@@ -6,35 +6,91 @@ use std::thread;
 use tauri::{AppHandle, Emitter, Manager};
 use tracing::{error, info};
 
-pub fn start_desktop_listener(app: AppHandle) {
-    let is_listening = Arc::new(AtomicBool::new(true));
+#[derive(Default)]
+pub struct DesktopListener {
+    enabled: Arc<AtomicBool>,
+    started: AtomicBool,
+}
 
-    thread::spawn(move || {
-        info!("Desktop keyboard listener started");
+impl DesktopListener {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
 
-        let callback = move |event: rdev::Event| {
-            if !is_listening.load(Ordering::Relaxed) {
-                return;
-            }
+    pub fn set_enabled(&self, app: AppHandle, enabled: bool) {
+        self.enabled.store(enabled, Ordering::Relaxed);
+        if enabled {
+            self.start_once(app);
+        }
+    }
 
-            if let EventType::KeyPress(key) = event.event_type {
-                // Don't emit if QuikFind window is already visible (avoids double-input)
-                if is_quikfind_visible(&app) {
+    fn start_once(&self, app: AppHandle) {
+        if self.started.swap(true, Ordering::Relaxed) {
+            return;
+        }
+
+        let enabled = self.enabled.clone();
+        thread::spawn(move || {
+            info!("Type to Search listener started");
+            let modifiers = Arc::new(parking_lot::Mutex::new(ModifierState::default()));
+
+            let callback = move |event: rdev::Event| {
+                update_modifiers(&modifiers, &event.event_type);
+                if !enabled.load(Ordering::Relaxed) {
                     return;
                 }
 
-                if is_on_desktop() {
-                    if let Some(ch) = key_to_char(key) {
-                        let _ = app.emit("desktop-key", ch.to_string());
-                    }
+                let EventType::KeyPress(key) = event.event_type else {
+                    return;
+                };
+                if is_modifier_key(key) || modifiers.lock().any_pressed() {
+                    return;
                 }
-            }
-        };
+                if is_quikfind_visible(&app) || !is_on_desktop() {
+                    return;
+                }
+                if let Some(ch) = event_name_to_char(event.name.as_deref()) {
+                    let _ = app.emit("desktop-key", ch.to_string());
+                }
+            };
 
-        if let Err(error) = listen(callback) {
-            error!("Global keyboard listener error: {:?}", error);
-        }
-    });
+            if let Err(err) = listen(callback) {
+                error!("Type to Search listener error: {:?}", err);
+            }
+        });
+    }
+}
+
+#[derive(Default)]
+struct ModifierState {
+    ctrl: bool,
+    alt: bool,
+    shift: bool,
+    meta: bool,
+}
+
+impl ModifierState {
+    const fn any_pressed(&self) -> bool {
+        self.ctrl || self.alt || self.shift || self.meta
+    }
+}
+
+fn update_modifiers(modifiers: &parking_lot::Mutex<ModifierState>, event_type: &EventType) {
+    let (key, pressed) = match event_type {
+        EventType::KeyPress(key) => (*key, true),
+        EventType::KeyRelease(key) => (*key, false),
+        _ => return,
+    };
+
+    let mut state = modifiers.lock();
+    match key {
+        Key::ControlLeft | Key::ControlRight => state.ctrl = pressed,
+        Key::Alt | Key::AltGr => state.alt = pressed,
+        Key::ShiftLeft | Key::ShiftRight => state.shift = pressed,
+        Key::MetaLeft | Key::MetaRight => state.meta = pressed,
+        _ => {}
+    }
 }
 
 fn is_quikfind_visible(app: &AppHandle) -> bool {
@@ -43,57 +99,29 @@ fn is_quikfind_visible(app: &AppHandle) -> bool {
         .unwrap_or(false)
 }
 
-
-
-fn key_to_char(key: Key) -> Option<char> {
-    match key {
-        Key::KeyA => Some('a'),
-        Key::KeyB => Some('b'),
-        Key::KeyC => Some('c'),
-        Key::KeyD => Some('d'),
-        Key::KeyE => Some('e'),
-        Key::KeyF => Some('f'),
-        Key::KeyG => Some('g'),
-        Key::KeyH => Some('h'),
-        Key::KeyI => Some('i'),
-        Key::KeyJ => Some('j'),
-        Key::KeyK => Some('k'),
-        Key::KeyL => Some('l'),
-        Key::KeyM => Some('m'),
-        Key::KeyN => Some('n'),
-        Key::KeyO => Some('o'),
-        Key::KeyP => Some('p'),
-        Key::KeyQ => Some('q'),
-        Key::KeyR => Some('r'),
-        Key::KeyS => Some('s'),
-        Key::KeyT => Some('t'),
-        Key::KeyU => Some('u'),
-        Key::KeyV => Some('v'),
-        Key::KeyW => Some('w'),
-        Key::KeyX => Some('x'),
-        Key::KeyY => Some('y'),
-        Key::KeyZ => Some('z'),
-        Key::Num0 => Some('0'),
-        Key::Num1 => Some('1'),
-        Key::Num2 => Some('2'),
-        Key::Num3 => Some('3'),
-        Key::Num4 => Some('4'),
-        Key::Num5 => Some('5'),
-        Key::Num6 => Some('6'),
-        Key::Num7 => Some('7'),
-        Key::Num8 => Some('8'),
-        Key::Num9 => Some('9'),
-        Key::Space => Some(' '),
-        Key::Minus => Some('-'),
-        Key::Equal => Some('='),
-        Key::Comma => Some(','),
-        Key::Dot => Some('.'),
-        Key::Slash => Some('/'),
-        Key::SemiColon => Some(';'),
-        Key::Quote => Some('\''),
-        Key::BackSlash => Some('\\'),
-        Key::LeftBracket => Some('['),
-        Key::RightBracket => Some(']'),
-        _ => None,
+fn event_name_to_char(name: Option<&str>) -> Option<char> {
+    let name = name?;
+    let mut chars = name.chars();
+    let ch = chars.next()?;
+    if chars.next().is_some() {
+        return None;
     }
+    if ch.is_control() {
+        return None;
+    }
+    Some(ch)
+}
+
+fn is_modifier_key(key: Key) -> bool {
+    matches!(
+        key,
+        Key::ControlLeft
+            | Key::ControlRight
+            | Key::Alt
+            | Key::AltGr
+            | Key::ShiftLeft
+            | Key::ShiftRight
+            | Key::MetaLeft
+            | Key::MetaRight
+    )
 }

@@ -25,6 +25,7 @@ export interface AppResult {
 
 export interface IndexStatus {
   is_indexing: boolean;
+  phase: 'idle' | 'metadata' | 'content' | string;
   files_indexed: number;
   total_files: number;
   progress_percent: number;
@@ -39,8 +40,8 @@ export interface AppSettings {
   hotkey: string;
   theme: 'dark' | 'light' | 'system';
   enable_content_search: boolean;
+  enable_type_to_search: boolean;
   indexing_interval_minutes: number;
-  fuzzy_threshold: number;
   launch_on_startup: boolean;
 }
 

@@ -35,6 +35,9 @@ pub enum QuikFindError {
     #[error("Plugin error: {0}")]
     Plugin(String),
 
+    #[error("Operation cancelled")]
+    Cancelled,
+
     #[error("{0}")]
     Generic(String),
 }

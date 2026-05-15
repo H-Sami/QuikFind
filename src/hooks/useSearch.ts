@@ -2,6 +2,7 @@ import { useState, useCallback, useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { SearchResult, SearchResults } from '../types';
 import { useStore } from '../store';
+import { useUIStore } from '../stores/uiStore';
 import { SEARCH_DEBOUNCE_SHORT, SEARCH_DEBOUNCE_LONG } from './constants';
 
 export function useSearch() {
@@ -14,18 +15,13 @@ export function useSearch() {
   const queryRef = useRef(query);
   const selectedIndexRef = useRef(selectedIndex);
   const { settings } = useStore();
+  const showToast = useUIStore((state) => state.showToast);
 
   resultsRef.current = results;
   queryRef.current = query;
   selectedIndexRef.current = selectedIndex;
 
   const performSearch = useCallback(async (searchQuery: string) => {
-    if (!searchQuery.trim()) {
-      searchIdRef.current++;
-      setResults([]);
-      setSelectedIndex(0);
-      return;
-    }
     const currentId = ++searchIdRef.current;
     setIsLoading(true);
     try {
@@ -37,12 +33,16 @@ export function useSearch() {
       if (currentId !== searchIdRef.current) return;
       setResults(searchResults.results);
       setSelectedIndex(0);
-    } catch {
-      if (currentId === searchIdRef.current) setResults([]);
+    } catch (error) {
+      console.error('Search failed:', error);
+      if (currentId === searchIdRef.current) {
+        setResults([]);
+        showToast('Search failed', 'error');
+      }
     } finally {
       if (currentId === searchIdRef.current) setIsLoading(false);
     }
-  }, [settings.max_results]);
+  }, [settings.max_results, showToast]);
 
   useEffect(() => {
     const delay = query.trim().length <= 3 ? SEARCH_DEBOUNCE_SHORT : SEARCH_DEBOUNCE_LONG;

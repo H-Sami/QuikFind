@@ -1,4 +1,2 @@
 export const SEARCH_DEBOUNCE_SHORT = 80;
 export const SEARCH_DEBOUNCE_LONG = 200;
-export const VIRTUALIZATION_THRESHOLD = 50;
-export const ITEM_HEIGHT = 60;

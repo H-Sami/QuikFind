@@ -1,20 +1,16 @@
 use crate::error::{QuikFindError, Result};
-use std::num::NonZeroUsize;
 use crate::models::{
-    compute_file_id, schema as tantivy_schema, FileEntry, ResultKind, SearchResult,
-    SearchResults,
+    compute_file_id, schema as tantivy_schema, FileEntry, ResultKind, SearchResult, SearchResults,
 };
 use lru::LruCache;
-use nucleo::{Matcher, Config};
+use nucleo::{Config, Matcher};
+use std::num::NonZeroUsize;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tantivy::collector::TopDocs;
 use tantivy::directory::MmapDirectory;
-use tantivy::query::{
-    BooleanQuery, FuzzyTermQuery, QueryParser,
-};
+use tantivy::query::{BooleanQuery, FuzzyTermQuery, QueryParser};
 use tantivy::schema::{Field, Schema, Value};
 use tantivy::{doc, Index, IndexReader, IndexSettings, IndexWriter, ReloadPolicy, TantivyDocument};
 use tokio::sync::RwLock;
@@ -27,9 +23,7 @@ pub struct SearchEngine {
     schema: Schema,
     fields: SearchFields,
     query_cache: Arc<std::sync::Mutex<LruCache<String, SearchResults>>>,
-    popular_cache: Arc<std::sync::Mutex<LruCache<String, SearchResults>>>,
     matcher: Arc<parking_lot::Mutex<Matcher>>,
-    is_indexing: Arc<AtomicBool>,
 }
 
 struct SearchFields {
@@ -56,7 +50,6 @@ impl SearchEngine {
     #[must_use]
     pub fn new() -> Self {
         let schema = tantivy_schema().clone();
-        // SAFETY: all field names are defined in build_tantivy_schema and are guaranteed to exist
         #[allow(clippy::unwrap_used)]
         let fields = SearchFields {
             path: schema.get_field("path").unwrap(),
@@ -75,17 +68,10 @@ impl SearchEngine {
             schema,
             fields,
             query_cache: Arc::new(std::sync::Mutex::new(LruCache::new(
-                // SAFETY: 200 is a non-zero compile-time constant
                 #[allow(clippy::unwrap_used)]
                 NonZeroUsize::new(200).unwrap(),
             ))),
-            popular_cache: Arc::new(std::sync::Mutex::new(LruCache::new(
-                // SAFETY: 50 is a non-zero compile-time constant
-                #[allow(clippy::unwrap_used)]
-                NonZeroUsize::new(50).unwrap(),
-            ))),
             matcher: Arc::new(parking_lot::Mutex::new(Matcher::new(Config::DEFAULT))),
-            is_indexing: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -96,113 +82,91 @@ impl SearchEngine {
     pub fn initialize_index(&self, index_dir: &Path) -> Result<()> {
         std::fs::create_dir_all(index_dir).map_err(QuikFindError::Io)?;
 
-        let mmap_dir = MmapDirectory::open(index_dir).map_err(|e| QuikFindError::Generic(format!("MmapDir: {e}")))?;
+        let mmap_dir = MmapDirectory::open(index_dir)
+            .map_err(|e| QuikFindError::Generic(format!("MmapDir: {e}")))?;
 
-        let index = if Index::exists(&mmap_dir).map_err(|e| QuikFindError::Generic(format!("Index exists: {e}")))? {
+        let index = if Index::exists(&mmap_dir)
+            .map_err(|e| QuikFindError::Generic(format!("Index exists: {e}")))?
+        {
             info!("Opening existing Tantivy index at {:?}", index_dir);
             Index::open(mmap_dir).map_err(QuikFindError::Tantivy)?
         } else {
             info!("Creating new Tantivy index at {:?}", index_dir);
-            Index::create(mmap_dir, self.schema.clone(), IndexSettings::default()).map_err(QuikFindError::Tantivy)?
+            Index::create(mmap_dir, self.schema.clone(), IndexSettings::default())
+                .map_err(QuikFindError::Tantivy)?
         };
 
-        let writer = index
-            .writer(256_000_000)
-            .map_err(QuikFindError::Tantivy)?;
-
+        let writer = index.writer(256_000_000).map_err(QuikFindError::Tantivy)?;
         let reader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::Manual)
             .try_into()
             .map_err(QuikFindError::Tantivy)?;
 
-        // Use blocking_write since Tauri setup doesn't have a tokio runtime context
         *self.index.blocking_write() = Some(index);
         *self.reader.blocking_write() = Some(reader);
-        *self.writer.lock().map_err(|e| QuikFindError::Generic(format!("Writer lock: {e}")))? = Some(writer);
+        *self
+            .writer
+            .lock()
+            .map_err(|e| QuikFindError::Generic(format!("Writer lock: {e}")))? = Some(writer);
 
         info!("Tantivy index initialized successfully");
         Ok(())
     }
 
-    /// Indexes a file entry document.
+    /// Indexes or replaces a file entry document.
     ///
     /// # Errors
     /// Returns an error if the index writer is not available or indexing fails.
     pub fn index_document(&self, entry: &FileEntry) -> Result<()> {
-        let mut writer_lock = self.writer.lock().map_err(|e| {
-            QuikFindError::Generic(format!("Writer lock: {e}"))
-        })?;
-        let writer = writer_lock
-            .as_mut()
-            .ok_or(QuikFindError::WriterNotReady)?;
+        let mut writer_lock = self
+            .writer
+            .lock()
+            .map_err(|e| QuikFindError::Generic(format!("Writer lock: {e}")))?;
+        let writer = writer_lock.as_mut().ok_or(QuikFindError::WriterNotReady)?;
 
-        let file_id = compute_file_id(&entry.path, entry.size, entry.modified);
-
-        let document = doc!(
-            self.fields.path => entry.path.as_str(),
-            self.fields.name => entry.name.as_str(),
-            self.fields.content => entry.content.as_deref().unwrap_or(""),
-            self.fields.size => entry.size,
-            self.fields.modified => entry.modified,
-            self.fields.kind => entry.kind.as_str(),
-            self.fields.id => file_id.as_str(),
-        );
-
+        let file_id = compute_file_id(&entry.path);
+        writer.delete_term(tantivy::Term::from_field_text(self.fields.id, &file_id));
         writer
-            .add_document(document)
+            .add_document(self.document_for_entry(entry, &file_id))
             .map_err(QuikFindError::Tantivy)?;
 
         Ok(())
     }
 
-    /// Deletes a document from the index by its ID.
+    /// Deletes a document from the index by its stable ID.
     ///
     /// # Errors
     /// Returns an error if the index writer is not available.
     pub fn delete_document(&self, doc_id: &str) -> Result<()> {
-        let mut writer_lock = self.writer.lock().map_err(|e| {
-            QuikFindError::Generic(format!("Writer lock: {e}"))
-        })?;
-        let writer = writer_lock
-            .as_mut()
-            .ok_or(QuikFindError::WriterNotReady)?;
-
-        let term = tantivy::Term::from_field_text(self.fields.id, doc_id);
-        writer.delete_term(term);
-        Ok(())
-    }
-
-    /// Replaces an existing document by deleting the old one (matched by its `id` field)
-    /// and adding a new one. Used during content enrichment (Phase 2) where only the
-    /// `content` field changes.
-    ///
-    /// # Errors
-    /// Returns an error if the index writer is not available or Tantivy operations fail.
-    pub fn update_document(&self, entry: &FileEntry) -> Result<()> {
-        let file_id = compute_file_id(&entry.path, entry.size, entry.modified);
         let mut writer_lock = self
             .writer
             .lock()
             .map_err(|e| QuikFindError::Generic(format!("Writer lock: {e}")))?;
-        let writer = writer_lock
-            .as_mut()
-            .ok_or(QuikFindError::WriterNotReady)?;
+        let writer = writer_lock.as_mut().ok_or(QuikFindError::WriterNotReady)?;
 
-        let term = tantivy::Term::from_field_text(self.fields.id, &file_id);
-        writer.delete_term(term);
+        writer.delete_term(tantivy::Term::from_field_text(self.fields.id, doc_id));
+        Ok(())
+    }
 
-        let document = doc!(
+    /// Replaces an existing document by stable path identity.
+    ///
+    /// # Errors
+    /// Returns an error if the index writer is not available or Tantivy operations fail.
+    pub fn update_document(&self, entry: &FileEntry) -> Result<()> {
+        self.index_document(entry)
+    }
+
+    fn document_for_entry(&self, entry: &FileEntry, file_id: &str) -> TantivyDocument {
+        doc!(
             self.fields.path => entry.path.as_str(),
             self.fields.name => entry.name.as_str(),
             self.fields.content => entry.content.as_deref().unwrap_or(""),
             self.fields.size => entry.size,
             self.fields.modified => entry.modified,
             self.fields.kind => entry.kind.as_str(),
-            self.fields.id => file_id.as_str(),
-        );
-        writer.add_document(document).map_err(QuikFindError::Tantivy)?;
-        Ok(())
+            self.fields.id => file_id,
+        )
     }
 
     /// Commits pending changes to the index.
@@ -210,19 +174,17 @@ impl SearchEngine {
     /// # Errors
     /// Returns an error if the index writer is not available or commit fails.
     pub fn commit(&self) -> Result<()> {
-        let mut writer_lock = self.writer.lock().map_err(|e| {
-            QuikFindError::Generic(format!("Writer lock: {e}"))
-        })?;
-        let writer = writer_lock
-            .as_mut()
-            .ok_or(QuikFindError::WriterNotReady)?;
+        let mut writer_lock = self
+            .writer
+            .lock()
+            .map_err(|e| QuikFindError::Generic(format!("Writer lock: {e}")))?;
+        let writer = writer_lock.as_mut().ok_or(QuikFindError::WriterNotReady)?;
 
         writer.commit().map_err(QuikFindError::Tantivy)?;
         Ok(())
     }
 
     /// Forces an immediate reader reload so committed data is visible to searches.
-    /// Used by finish_batch_index and the file watcher.
     ///
     /// # Errors
     /// Returns an error if the index reader cannot be reloaded.
@@ -234,21 +196,27 @@ impl SearchEngine {
         Ok(())
     }
 
-    #[must_use]
-    pub fn is_indexing(&self) -> bool {
-        self.is_indexing.load(Ordering::Relaxed)
+    /// Clears all query caches.
+    ///
+    /// # Errors
+    /// Returns an error if a cache mutex is poisoned.
+    pub fn invalidate_caches(&self) -> Result<()> {
+        self.query_cache
+            .lock()
+            .map_err(|e| QuikFindError::Generic(format!("Cache lock: {e}")))?
+            .clear();
+        Ok(())
     }
 
-    fn fuzzy_score_name(&self, query: &str, name: &str) -> f32 {
-        let mut matcher = self.matcher.lock();
-        let result = matcher.fuzzy_match(
-            nucleo::Utf32Str::Ascii(query.as_bytes()),
-            nucleo::Utf32Str::Ascii(name.as_bytes()),
-        );
-        match result {
-            Some(score) if score > 0 => f32::from(score) / 100.0,
-            _ => 0.0,
-        }
+    /// Commits mutations, reloads the reader, and invalidates cached queries.
+    ///
+    /// # Errors
+    /// Returns an error if commit or reload fails.
+    pub async fn commit_reload_invalidate(&self) -> Result<()> {
+        self.commit()?;
+        self.reload_searcher().await?;
+        self.invalidate_caches()?;
+        Ok(())
     }
 
     fn fuzzy_score_name_parallel(
@@ -290,29 +258,21 @@ impl SearchEngine {
             .get_first(self.fields.id)
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        let size: Option<u64> = doc
-            .get_first(self.fields.size)
-            .and_then(|v| v.as_u64());
-        let modified: Option<i64> = doc
-            .get_first(self.fields.modified)
-            .and_then(|v| v.as_i64());
+        let size = doc.get_first(self.fields.size).and_then(|v| v.as_u64());
+        let modified = doc.get_first(self.fields.modified).and_then(|v| v.as_i64());
 
         let name_score = Self::fuzzy_score_name_parallel(&self.matcher, orig_query, name);
-
-        let recency_boost = modified
-            .map_or(0.0, |m| {
-                // REASON: recency boost for scoring; float cast precision is acceptable
-                #[allow(clippy::cast_precision_loss)]
-                let age_hours = (now_ts - m) as f64 / 3600.0;
-                if age_hours < 24.0 {
-                    1.0
-                } else if age_hours < 168.0 {
-                    0.5
-                } else {
-                    0.0
-                }
-            });
-
+        let recency_boost = modified.map_or(0.0, |m| {
+            #[allow(clippy::cast_precision_loss)]
+            let age_hours = (now_ts - m) as f64 / 3600.0;
+            if age_hours < 24.0 {
+                1.0
+            } else if age_hours < 168.0 {
+                0.5
+            } else {
+                0.0
+            }
+        });
         let final_score = name_score.mul_add(3.0, tantivy_score.max(0.0)) + (recency_boost * 0.5);
 
         SearchResult {
@@ -327,35 +287,31 @@ impl SearchEngine {
         }
     }
 
-    /// Performs a search across the index.
+    /// Performs a search across the file index.
     ///
     /// # Errors
     /// Returns an error if the reader is not initialized.
-    ///
-    /// # Panics
-    /// Panics if the query cache mutex is poisoned.
     pub async fn perform_search(
         &self,
         query: &str,
         limit: u32,
         offset: u32,
-        _fuzzy_threshold: f32,
         max_results: u32,
         enable_content_search: bool,
+        use_cache: bool,
     ) -> Result<SearchResults> {
         let start = Instant::now();
 
         if query.trim().is_empty() {
-            return Ok(SearchResults { results: Vec::new(), total: 0, query_time_ms: 0 });
+            return Ok(SearchResults {
+                results: Vec::new(),
+                total: 0,
+                query_time_ms: 0,
+            });
         }
 
-        let cache_key = format!("{query}:{limit}:{offset}");
-
-        // Do not serve cached results during indexing. Mid-index searches return partial or
-        // empty data; caching them would poison the cache and hide real results after indexing.
-        let is_currently_indexing = self.is_indexing.load(Ordering::Relaxed);
-        if !is_currently_indexing {
-            // SAFETY: cache mutex is never held across a panic boundary
+        let cache_key = search_cache_key(query, limit, offset, max_results, enable_content_search);
+        if use_cache {
             #[allow(clippy::unwrap_used)]
             if let Some(cached) = self.query_cache.lock().unwrap().get(&cache_key) {
                 return Ok(cached.clone());
@@ -363,10 +319,6 @@ impl SearchEngine {
         }
 
         let query_lower = query.to_lowercase();
-
-        // Get a fresh Searcher snapshot from the reader on every request.
-        // reload_searcher() is called explicitly after every commit, so the reader
-        // always reflects the latest committed state.
         let searcher = {
             let reader_lock = self.reader.read().await;
             reader_lock
@@ -381,7 +333,6 @@ impl SearchEngine {
             vec![self.fields.name, self.fields.path]
         };
         let query_parser = QueryParser::for_index(searcher.index(), query_fields);
-
         let fuzzy_query = FuzzyTermQuery::new(
             tantivy::Term::from_field_text(self.fields.name, query_lower.as_str()),
             1,
@@ -413,7 +364,6 @@ impl SearchEngine {
         }
 
         let now_ts = chrono::Utc::now().timestamp();
-
         let mut scored_results: Vec<SearchResult> = all_docs
             .into_iter()
             .map(|(tantivy_score, doc)| {
@@ -421,120 +371,38 @@ impl SearchEngine {
             })
             .collect();
 
-        scored_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-        scored_results.dedup_by(|a, b| a.path == b.path);
+        scored_results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        deduplicate_by_path(&mut scored_results);
 
         let total = scored_results.len() as u64;
         let effective_limit = limit.min(max_results);
-        let results: Vec<SearchResult> = scored_results
+        let results = scored_results
             .into_iter()
             .skip(offset as usize)
             .take(effective_limit as usize)
             .collect();
 
-        // REASON: query times < 1ms are still valid as 0; u128->u64 truncation is safe for this range
         #[allow(clippy::cast_possible_truncation)]
         let query_time_ms = start.elapsed().as_millis() as u64;
+        let search_results = SearchResults {
+            results,
+            total,
+            query_time_ms,
+        };
 
-        let search_results = SearchResults { results, total, query_time_ms };
-
-        // Only cache when the index is stable — never during indexing
-        if !is_currently_indexing {
-            // SAFETY: cache mutexes are never held across a panic boundary
+        if use_cache {
             #[allow(clippy::unwrap_used)]
-            {
-                self.query_cache.lock().unwrap().put(cache_key, search_results.clone());
-            }
-            if query.len() <= 3 {
-                #[allow(clippy::unwrap_used)]
-                self.popular_cache.lock().unwrap().put(
-                    format!("pop:{query}:{limit}:{offset}"),
-                    search_results.clone(),
-                );
-            }
+            self.query_cache
+                .lock()
+                .unwrap()
+                .put(cache_key, search_results.clone());
         }
 
         Ok(search_results)
-    }
-
-    #[must_use]
-    pub fn search_apps(
-        &self,
-        query: &str,
-        apps: &[(String, String, String)],
-    ) -> Vec<super::models::AppResult> {
-        if query.trim().is_empty() {
-            return apps
-                .iter()
-                .take(20)
-                .map(|(id, name, path)| super::models::AppResult {
-                    id: id.clone(),
-                    name: name.clone(),
-                    path: path.clone(),
-                    icon: None,
-                    score: 0.0,
-                })
-                .collect();
-        }
-
-        let query_lower = query.to_lowercase();
-        let mut scored: Vec<(f32, &(String, String, String))> = apps
-            .iter()
-            .map(|app| {
-                let name_score = self.fuzzy_score_name(&query_lower, &app.1);
-                let path_score = if app.2.to_lowercase().contains(&query_lower) {
-                    0.5
-                } else {
-                    0.0
-                };
-                let exact_prefix = if app.1.to_lowercase().starts_with(&query_lower) {
-                    1.0
-                } else {
-                    0.0
-                };
-                let score = name_score.mul_add(3.0, exact_prefix * 2.0) + path_score;
-                (score, app)
-            })
-            .collect();
-
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        scored.retain(|(s, _)| *s > 0.0);
-
-        scored
-            .into_iter()
-            .take(20)
-            .map(|(score, (id, name, path))| super::models::AppResult {
-                id: id.clone(),
-                name: name.clone(),
-                path: path.clone(),
-                icon: None,
-                score,
-            })
-            .collect()
-    }
-
-    /// Starts a batch indexing session.
-    pub fn start_batch_index(&self) {
-        self.is_indexing.store(true, Ordering::Relaxed);
-    }
-
-    /// Finishes a batch indexing session and reloads the searcher.
-    ///
-    /// # Errors
-    /// Returns an error if committing or reloading fails.
-    pub async fn finish_batch_index(&self) -> Result<()> {
-        self.commit()?;
-        self.is_indexing.store(false, Ordering::Relaxed);
-        self.reload_searcher().await?;
-        // Invalidate query caches so post-index searches see real results
-        // SAFETY: cache mutexes are never held across a panic boundary
-        #[allow(clippy::unwrap_used)]
-        {
-            self.query_cache.lock().unwrap().clear();
-            self.popular_cache.lock().unwrap().clear();
-        }
-        info!("Batch indexing complete, searcher reloaded, caches cleared");
-        Ok(())
     }
 
     /// Clears the entire search index.
@@ -543,73 +411,106 @@ impl SearchEngine {
     /// Returns an error if the index writer is not available or clearing fails.
     pub async fn clear_index(&self) -> Result<()> {
         {
-            let mut writer_lock = self.writer.lock().map_err(|e| {
-                QuikFindError::Generic(format!("Writer lock: {e}"))
-            })?;
-            let writer = writer_lock
-                .as_mut()
-                .ok_or(QuikFindError::WriterNotReady)?;
-
-            writer.delete_all_documents().map_err(QuikFindError::Tantivy)?;
-            writer.commit().map_err(QuikFindError::Tantivy)?;
-        }
-        self.reload_searcher().await?;
-        info!("Index cleared");
-        Ok(())
-    }
-
-    /// Completely wipes the index by deleting the index directory and recreating it.
-    /// Use this over clear_index when you need to guarantee no old segments remain on disk.
-    ///
-    /// # Errors
-    /// Returns an error if the directory cannot be deleted/recreated.
-    pub async fn clear_index_completely(&self, index_dir: &Path) -> Result<()> {
-        {
             let mut writer_lock = self
                 .writer
                 .lock()
                 .map_err(|e| QuikFindError::Generic(format!("Writer lock: {e}")))?;
-            *writer_lock = None;
+            let writer = writer_lock.as_mut().ok_or(QuikFindError::WriterNotReady)?;
+
+            writer
+                .delete_all_documents()
+                .map_err(QuikFindError::Tantivy)?;
+            writer.commit().map_err(QuikFindError::Tantivy)?;
         }
-
-        *self.index.write().await = None;
-        // No self.searcher to reset — reader.searcher() is always called fresh
-
-        if index_dir.exists() {
-            std::fs::remove_dir_all(index_dir).map_err(QuikFindError::Io)?;
-        }
-        std::fs::create_dir_all(index_dir).map_err(QuikFindError::Io)?;
-
-        let mmap_dir = MmapDirectory::open(index_dir)
-            .map_err(|e| QuikFindError::Generic(format!("MmapDir: {e}")))?;
-
-        let index = Index::create(mmap_dir, self.schema.clone(), IndexSettings::default())
-            .map_err(QuikFindError::Tantivy)?;
-
-        let writer = index.writer(256_000_000).map_err(QuikFindError::Tantivy)?;
-
-        let reader = index
-            .reader_builder()
-            .reload_policy(ReloadPolicy::Manual)
-            .try_into()
-            .map_err(QuikFindError::Tantivy)?;
-
-        *self.index.write().await = Some(index);
-        *self.reader.write().await = Some(reader);
-        *self.writer
-            .lock()
-            .map_err(|e| QuikFindError::Generic(format!("Writer lock: {e}")))? = Some(writer);
-
-        self.query_cache
-            .lock()
-            .map_err(|e| QuikFindError::Generic(format!("Cache lock: {e}")))?
-            .clear();
-        self.popular_cache
-            .lock()
-            .map_err(|e| QuikFindError::Generic(format!("Cache lock: {e}")))?
-            .clear();
-
-        info!("Index completely wiped and recreated at {:?}", index_dir);
+        self.reload_searcher().await?;
+        self.invalidate_caches()?;
+        info!("Index cleared");
         Ok(())
+    }
+}
+
+fn search_cache_key(
+    query: &str,
+    limit: u32,
+    offset: u32,
+    max_results: u32,
+    enable_content_search: bool,
+) -> String {
+    format!(
+        "{}:{}:{}:{}:{}",
+        query.trim().to_lowercase(),
+        limit,
+        offset,
+        max_results,
+        enable_content_search
+    )
+}
+
+fn deduplicate_by_path(results: &mut Vec<SearchResult>) {
+    let mut seen = std::collections::HashSet::new();
+    results.retain(|result| seen.insert(result.path.replace('\\', "/").to_lowercase()));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_key_includes_result_affecting_inputs() {
+        let base = search_cache_key("Readme", 10, 0, 25, false);
+
+        assert_ne!(base, search_cache_key("Readme", 10, 0, 25, true));
+        assert_ne!(base, search_cache_key("Readme", 20, 0, 25, false));
+        assert_ne!(base, search_cache_key("Readme", 10, 1, 25, false));
+        assert_ne!(base, search_cache_key("Readme", 10, 0, 50, false));
+        assert_eq!(base, search_cache_key(" readme ", 10, 0, 25, false));
+    }
+
+    #[test]
+    fn deduplication_keeps_highest_scored_path() {
+        let mut results = vec![
+            SearchResult {
+                id: "1".to_string(),
+                path: "C:\\Temp\\Note.txt".to_string(),
+                name: "Note.txt".to_string(),
+                kind: ResultKind::File,
+                score: 10.0,
+                size: None,
+                modified: None,
+                icon: None,
+            },
+            SearchResult {
+                id: "2".to_string(),
+                path: "c:/temp/note.txt".to_string(),
+                name: "Note.txt".to_string(),
+                kind: ResultKind::File,
+                score: 3.0,
+                size: None,
+                modified: None,
+                icon: None,
+            },
+        ];
+
+        deduplicate_by_path(&mut results);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "1");
+    }
+
+    #[test]
+    fn invalidate_caches_clears_query_cache() {
+        let engine = SearchEngine::new();
+        engine.query_cache.lock().unwrap().put(
+            search_cache_key("a", 1, 0, 1, false),
+            SearchResults {
+                results: Vec::new(),
+                total: 0,
+                query_time_ms: 0,
+            },
+        );
+
+        engine.invalidate_caches().unwrap();
+
+        assert_eq!(engine.query_cache.lock().unwrap().len(), 0);
     }
 }

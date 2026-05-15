@@ -1,3 +1,5 @@
+import type React from 'react';
+
 export function matchShortcut(e: KeyboardEvent | React.KeyboardEvent, shortcutKeys: string): boolean {
   const parts = shortcutKeys.replace(/CmdOrCtrl/g, 'Ctrl').split('+');
   const key = parts[parts.length - 1];
@@ -15,13 +17,9 @@ export function matchShortcut(e: KeyboardEvent | React.KeyboardEvent, shortcutKe
   if (shiftRequired !== shiftPressed) return false;
   if (altRequired !== altPressed) return false;
 
-  const eventKey = e.key;
   switch (key) {
-    case '↑': return eventKey === 'ArrowUp';
-    case '↓': return eventKey === 'ArrowDown';
-    case '?': return eventKey === '/' || eventKey === '?';
-    case ',': return eventKey === ',';
-    case 'Esc': return eventKey === 'Escape';
-    default: return eventKey.toLowerCase() === key.toLowerCase();
+    case '?': return e.key === '/' || e.key === '?';
+    case 'Esc': return e.key === 'Escape';
+    default: return e.key.toLowerCase() === key.toLowerCase();
   }
 }

@@ -3,7 +3,6 @@ import { loadFromStorage, saveToStorage } from '../utils/storage';
 import { DEFAULT_SHORTCUTS, ShortcutDefinition } from './shortcutDefaults';
 
 export type ThemeMode = 'dark' | 'light';
-export type Density = 'spacious' | 'balanced';
 
 export const ACCENT_PRESETS = [
   '#3b82f6', '#6366f1', '#8b5cf6', '#a855f7', '#d946ef',
@@ -23,7 +22,10 @@ function loadShortcuts(): ShortcutDefinition[] {
   try {
     const stored = localStorage.getItem('quikfind-shortcuts');
     if (stored) {
-      const parsed = JSON.parse(stored) as ShortcutDefinition[];
+      const parsed = (JSON.parse(stored) as ShortcutDefinition[]).map(shortcut => ({
+        ...shortcut,
+        keys: shortcut.keys === '\u00e2\u2020\u2018' ? 'ArrowUp' : shortcut.keys === '\u00e2\u2020\u201c' ? 'ArrowDown' : shortcut.keys,
+      }));
       if (Array.isArray(parsed) && parsed.length > 0) return parsed;
     }
   } catch {}
@@ -39,12 +41,10 @@ function saveShortcuts(shortcuts: ShortcutDefinition[]): void {
 interface UIState {
   theme: ThemeMode;
   accentColor: string;
-  density: Density;
   keyboardShortcuts: ShortcutDefinition[];
   toast: ToastState;
   setTheme: (theme: ThemeMode) => void;
   setAccentColor: (color: string) => void;
-  setDensity: (density: Density) => void;
   updateShortcut: (id: string, keys: string) => void;
   resetShortcuts: () => void;
   showToast: (message: string, type?: ToastState['type']) => void;
@@ -54,7 +54,6 @@ interface UIState {
 export const useUIStore = create<UIState>((set, get) => ({
   theme: loadFromStorage<ThemeMode>('quikfind-theme', 'dark'),
   accentColor: loadFromStorage<string>('quikfind-accent', '#3b82f6'),
-  density: loadFromStorage<Density>('quikfind-density', 'balanced'),
   keyboardShortcuts: loadShortcuts(),
   toast: { message: '', type: 'info', visible: false },
 
@@ -66,11 +65,6 @@ export const useUIStore = create<UIState>((set, get) => ({
   setAccentColor: (color) => {
     saveToStorage('quikfind-accent', color);
     set({ accentColor: color });
-  },
-
-  setDensity: (density) => {
-    saveToStorage('quikfind-density', density);
-    set({ density });
   },
 
   updateShortcut: (id, keys) => {

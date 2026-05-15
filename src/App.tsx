@@ -19,7 +19,7 @@ function App() {
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [settingsTab, setSettingsTab] = useState<'appearance' | 'shortcuts'>('appearance');
   const [indexStatus, setIndexStatus] = useState<IndexStatus | null>(null);
-  const { settings, loadSettings } = useStore();
+  const { loadSettings } = useStore();
   const { theme, accentColor, toast, hideToast } = useUIStore();
 
   const {
@@ -38,6 +38,7 @@ function App() {
   useKeyboardShortcuts({
     searchInputRef,
     resultsRef, queryRef, selectedIndexRef,
+    lastNavMethodRef,
     isSettingsOpenRef,
     setQuery, setResults, setSelectedIndex,
     setIsSettingsOpen, setSettingsTab,
@@ -80,7 +81,7 @@ function App() {
       const win = getCurrentWindow();
       const isVisible = await win.isVisible();
 
-      if (isVisible) return; // Already visible — normal input handles it
+      if (isVisible) return;
 
       await win.show();
       await win.setFocus();
@@ -109,6 +110,12 @@ function App() {
   }, [setSelectedIndex]);
 
   const handleOpenResult = useOpenResult();
+  const handleSearchKeyDown = useCallback((e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      lastNavMethodRef.current = 'keyboard';
+    }
+    handleKeyDown(e);
+  }, [handleKeyDown]);
 
   const hasSearch = query.trim().length > 0;
   const isIndexing = indexStatus?.is_indexing;
@@ -123,7 +130,7 @@ function App() {
             ref={searchInputRef}
             value={query}
             onChange={setQuery}
-            onKeyDown={handleKeyDown}
+            onKeyDown={handleSearchKeyDown}
             isLoading={isLoading}
           />
         </div>
@@ -170,9 +177,9 @@ function App() {
       <footer className="flex-shrink-0 px-4 pb-3">
         {!hasSearch && results.length === 0 && (
           <div className="flex items-center justify-center gap-4 text-[10px] text-[var(--text-tertiary)]">
-            <span>&uarr;&darr; <span className="text-[var(--text-tertiary)]/70">navigate</span></span>
-            <span>&#9090; <span className="text-[var(--text-tertiary)]/70">open</span></span>
-            <span>&#8984;, <span className="text-[var(--text-tertiary)]/70">settings</span></span>
+            <span>Up/Down <span className="text-[var(--text-tertiary)]/70">navigate</span></span>
+            <span>Enter <span className="text-[var(--text-tertiary)]/70">open</span></span>
+            <span>Ctrl+, <span className="text-[var(--text-tertiary)]/70">settings</span></span>
           </div>
         )}
       </footer>

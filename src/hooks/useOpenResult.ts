@@ -2,22 +2,23 @@ import { useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { SearchResult } from '../types';
-import { useStore } from '../store';
+import { useUIStore } from '../stores/uiStore';
 
 export function useOpenResult() {
-  const { addToHistory } = useStore();
+  const showToast = useUIStore((state) => state.showToast);
+
   return useCallback(async (result: SearchResult) => {
     try {
-      await invoke('open_path', { path: result.path });
-      await addToHistory({
-        id: result.id,
-        path: result.path,
-        name: result.name,
-        kind: result.kind,
-        opened_at: Date.now(),
-      });
-      const win = getCurrentWindow();
-      await win.hide();
-    } catch {}
-  }, [addToHistory]);
+      if (result.kind === 'App') {
+        await invoke('launch_app', { appId: result.id });
+      } else {
+        await invoke('open_path', { path: result.path });
+      }
+
+      await getCurrentWindow().hide();
+    } catch (error) {
+      console.error('Failed to open result:', { result, error });
+      showToast(`Failed to open ${result.name}`, 'error');
+    }
+  }, [showToast]);
 }

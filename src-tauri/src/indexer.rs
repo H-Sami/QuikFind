@@ -7,7 +7,7 @@ use jwalk::WalkDir;
 use rayon::prelude::*;
 use std::io::Read;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -40,6 +40,7 @@ struct IndexingContext<'a> {
     total_files: &'a AtomicU64,
     last_progress: &'a parking_lot::Mutex<Instant>,
     progress_tx: &'a mpsc::UnboundedSender<crate::models::IndexingProgress>,
+    cancel: &'a AtomicBool,
 }
 
 pub struct Indexer {
@@ -63,7 +64,8 @@ impl Indexer {
         paths: Vec<String>,
         excluded_patterns: &[String],
         progress_tx: mpsc::UnboundedSender<crate::models::IndexingProgress>,
-    ) -> Result<()> {
+        cancel: Arc<AtomicBool>,
+    ) -> Result<crate::models::IndexingProgress> {
         let start = Instant::now();
         let total_files = AtomicU64::new(0);
         let files_indexed = AtomicU64::new(0);
@@ -79,9 +81,8 @@ impl Indexer {
             total_files: &total_files,
             last_progress: &last_progress,
             progress_tx: &progress_tx,
+            cancel: &cancel,
         };
-
-        self.search_engine.start_batch_index();
 
         progress_tx
             .send(crate::models::IndexingProgress {
@@ -95,6 +96,10 @@ impl Indexer {
         let mut chunks_since_commit = 0u32;
 
         for path_str in prioritize_paths(paths) {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(QuikFindError::Cancelled);
+            }
+
             let path = Path::new(&path_str);
             if !path.exists() {
                 warn!("Index path does not exist: {}", path_str);
@@ -102,7 +107,14 @@ impl Indexer {
             }
 
             if path.is_file() {
-                if let Err(e) = self.index_file(path, ctx.exclude_set, ctx.files_indexed, IndexMode::MetadataOnly)
+                if let Err(e) = self
+                    .index_file(
+                        path,
+                        ctx.exclude_set,
+                        ctx.files_indexed,
+                        IndexMode::MetadataOnly,
+                    )
+                    .await
                 {
                     error!("Failed to index file {}: {}", path_str, e);
                 }
@@ -118,11 +130,16 @@ impl Indexer {
                 .into_iter()
             {
                 let Ok(entry) = entry else { continue };
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(QuikFindError::Cancelled);
+                }
                 let entry_path = entry.path();
                 if is_excluded(&entry_path, ctx.exclude_set) {
                     continue;
                 }
-                if entry.metadata().is_err() { continue; }
+                if entry.metadata().is_err() {
+                    continue;
+                }
                 // All files pass — binaries are indexed by name; only content extraction is gated.
 
                 total_files.fetch_add(1, Ordering::Relaxed);
@@ -130,19 +147,27 @@ impl Indexer {
 
                 if chunk.len() == CHUNK_SIZE {
                     let batch = std::mem::take(&mut chunk);
-                    self.process_chunk(&batch, &ctx, &mut chunks_since_commit, IndexMode::MetadataOnly)
-                        .await;
+                    self.process_chunk(
+                        &batch,
+                        &ctx,
+                        &mut chunks_since_commit,
+                        IndexMode::MetadataOnly,
+                    )
+                    .await;
                 }
             }
             if !chunk.is_empty() {
-                self.process_chunk(&chunk, &ctx, &mut chunks_since_commit, IndexMode::MetadataOnly)
-                    .await;
+                self.process_chunk(
+                    &chunk,
+                    &ctx,
+                    &mut chunks_since_commit,
+                    IndexMode::MetadataOnly,
+                )
+                .await;
             }
         }
 
-        // Final commit for any remaining uncommitted chunks
-        self.search_engine.commit().ok();
-        self.search_engine.finish_batch_index().await?;
+        self.search_engine.commit_reload_invalidate().await?;
 
         let elapsed = start.elapsed();
         let indexed_count = files_indexed.load(Ordering::Relaxed);
@@ -152,16 +177,16 @@ impl Indexer {
             "Indexing complete: {indexed_count} files in {elapsed:?} ({files_per_min:.0} files/min)",
         );
 
-        progress_tx
-            .send(crate::models::IndexingProgress {
-                files_indexed: indexed_count,
-                total_files: total_files.load(Ordering::Relaxed),
-                current_file: None,
-                errors: errors.lock().clone(),
-            })
-            .ok();
+        let summary = crate::models::IndexingProgress {
+            files_indexed: indexed_count,
+            total_files: total_files.load(Ordering::Relaxed),
+            current_file: None,
+            errors: errors.lock().clone(),
+        };
 
-        Ok(())
+        progress_tx.send(summary.clone()).ok();
+
+        Ok(summary)
     }
 
     /// Processes a single chunk of directory entries: parallel entry building, Tantivy indexing,
@@ -173,6 +198,10 @@ impl Indexer {
         chunks_since_commit: &mut u32,
         mode: IndexMode,
     ) {
+        if ctx.cancel.load(Ordering::Relaxed) {
+            return;
+        }
+
         // Phase 1: CPU-parallel processing (no lock held)
         let file_entries: Vec<_> = chunk
             .par_iter()
@@ -197,7 +226,7 @@ impl Indexer {
             let db = self.db.read().await;
             let doc_ids: Vec<String> = file_entries
                 .iter()
-                .map(|fe| compute_file_id(&fe.path, fe.size, fe.modified))
+                .map(|fe| compute_file_id(&fe.path))
                 .collect();
             let batch: Vec<_> = file_entries
                 .iter()
@@ -210,7 +239,7 @@ impl Indexer {
         // Periodic Tantivy commit
         *chunks_since_commit += 1;
         if *chunks_since_commit >= COMMITS_PER_FLUSH {
-            self.search_engine.commit().ok();
+            self.search_engine.commit_reload_invalidate().await.ok();
             *chunks_since_commit = 0;
         }
 
@@ -233,7 +262,7 @@ impl Indexer {
 
     /// Indexes a single file entry. Used for individual file paths passed directly (not via
     /// directory traversal).
-    fn index_file(
+    async fn index_file(
         &self,
         path: &Path,
         exclude_set: &GlobSet,
@@ -249,6 +278,14 @@ impl Indexer {
         self.search_engine
             .index_document(&file_entry)
             .map_err(|e| QuikFindError::Generic(format!("Index doc: {e}")))?;
+        let db = self.db.read().await;
+        let doc_id = compute_file_id(&file_entry.path);
+        db.record_indexed_file(
+            &file_entry.path,
+            file_entry.size,
+            file_entry.modified,
+            &doc_id,
+        )?;
         files_indexed.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -262,7 +299,8 @@ impl Indexer {
     pub async fn enrich_content(
         &self,
         progress_tx: mpsc::UnboundedSender<crate::models::IndexingProgress>,
-    ) -> Result<()> {
+        cancel: Arc<AtomicBool>,
+    ) -> Result<crate::models::IndexingProgress> {
         let all_files = {
             let db = self.db.read().await;
             db.get_all_indexed_files()
@@ -277,7 +315,14 @@ impl Indexer {
 
         if text_files.is_empty() {
             info!("No text files to enrich");
-            return Ok(());
+            let summary = crate::models::IndexingProgress {
+                files_indexed: 0,
+                total_files: 0,
+                current_file: None,
+                errors: Vec::new(),
+            };
+            progress_tx.send(summary.clone()).ok();
+            return Ok(summary);
         }
 
         info!("Enriching content for {} text files", text_files.len());
@@ -289,6 +334,10 @@ impl Indexer {
         let mut chunks_since_commit = 0u32;
 
         for chunk in text_files.chunks(CHUNK_SIZE) {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(QuikFindError::Cancelled);
+            }
+
             // Parallel content extraction
             let entries: Vec<_> = chunk
                 .par_iter()
@@ -316,10 +365,8 @@ impl Indexer {
             // Batch-update SQLite doc_ids (may have changed if file metadata changed)
             {
                 let db = self.db.read().await;
-                let doc_ids: Vec<String> = entries
-                    .iter()
-                    .map(|fe| compute_file_id(&fe.path, fe.size, fe.modified))
-                    .collect();
+                let doc_ids: Vec<String> =
+                    entries.iter().map(|fe| compute_file_id(&fe.path)).collect();
                 let batch: Vec<_> = entries
                     .iter()
                     .zip(doc_ids.iter())
@@ -330,7 +377,7 @@ impl Indexer {
 
             chunks_since_commit += 1;
             if chunks_since_commit >= COMMITS_PER_FLUSH {
-                self.search_engine.commit().ok();
+                self.search_engine.commit_reload_invalidate().await.ok();
                 chunks_since_commit = 0;
             }
 
@@ -351,13 +398,20 @@ impl Indexer {
             }
         }
 
-        self.search_engine.commit().ok();
+        self.search_engine.commit_reload_invalidate().await?;
         info!("Content enrichment complete for {} files", total);
-        Ok(())
+        let summary = crate::models::IndexingProgress {
+            files_indexed: files_indexed.load(Ordering::Relaxed),
+            total_files: total,
+            current_file: None,
+            errors: errors.lock().clone(),
+        };
+        progress_tx.send(summary.clone()).ok();
+        Ok(summary)
     }
 }
 
-fn build_glob_set(patterns: &[String]) -> Result<GlobSet> {
+pub(crate) fn build_glob_set(patterns: &[String]) -> Result<GlobSet> {
     let mut builder = GlobSetBuilder::new();
     for pattern in patterns {
         match Glob::new(pattern) {
@@ -374,7 +428,7 @@ fn build_glob_set(patterns: &[String]) -> Result<GlobSet> {
         .map_err(|e| QuikFindError::Generic(format!("GlobSet build: {e}")))
 }
 
-fn is_excluded(path: &Path, exclude_set: &GlobSet) -> bool {
+pub(crate) fn is_excluded(path: &Path, exclude_set: &GlobSet) -> bool {
     let path_str = path.to_string_lossy();
     if exclude_set.is_match(path_str.as_ref()) {
         return true;
@@ -393,7 +447,12 @@ fn is_excluded(path: &Path, exclude_set: &GlobSet) -> bool {
 /// is still being indexed.
 fn prioritize_paths(paths: Vec<String>) -> Vec<String> {
     const PRIORITY: &[&str] = &[
-        "Desktop", "Documents", "Downloads", "Pictures", "Music", "Videos",
+        "Desktop",
+        "Documents",
+        "Downloads",
+        "Pictures",
+        "Music",
+        "Videos",
     ];
     let (mut first, rest): (Vec<_>, Vec<_>) = paths.into_iter().partition(|p| {
         std::path::Path::new(p).components().any(|c| {
@@ -460,10 +519,7 @@ pub(crate) fn build_file_entry(
     }
 }
 
-fn process_entry(
-    entry: &jwalk::DirEntry<((), ())>,
-    mode: IndexMode,
-) -> Result<FileEntry> {
+fn process_entry(entry: &jwalk::DirEntry<((), ())>, mode: IndexMode) -> Result<FileEntry> {
     let path = entry.path();
     let metadata = entry
         .metadata()

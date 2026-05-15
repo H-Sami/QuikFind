@@ -9,7 +9,6 @@ interface AppStore {
   history: HistoryItem[];
   loadSettings: () => Promise<void>;
   updateSettings: (newSettings: Partial<AppSettings>) => Promise<void>;
-  addToHistory: (item: HistoryItem) => Promise<void>;
   loadHistory: () => Promise<void>;
 }
 
@@ -20,9 +19,8 @@ const defaultSettings: AppSettings = {
   hotkey: 'CmdOrCtrl+Space',
   theme: 'dark',
   enable_content_search: true,
+  enable_type_to_search: false,
   indexing_interval_minutes: 30,
-  fuzzy_threshold: 0.6,
-
   launch_on_startup: false,
 };
 
@@ -49,17 +47,7 @@ export const useStore = create<AppStore>((set, get) => ({
       set({ settings: updated });
     } catch (error) {
       console.error('Failed to update settings:', error);
-    }
-  },
-
-  addToHistory: async (item) => {
-    try {
-      await invoke('add_to_history', { item });
-      set(state => ({
-        history: [item, ...state.history.slice(0, HISTORY_LIMIT - 1)]
-      }));
-    } catch (error) {
-      console.error('Failed to add to history:', error);
+      throw error;
     }
   },
 

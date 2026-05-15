@@ -10,6 +10,7 @@ interface UseKeyboardShortcutsProps {
   resultsRef: React.MutableRefObject<SearchResult[]>;
   queryRef: React.MutableRefObject<string>;
   selectedIndexRef: React.MutableRefObject<number>;
+  lastNavMethodRef: React.MutableRefObject<'keyboard' | 'mouse'>;
   isSettingsOpenRef: React.MutableRefObject<boolean>;
   setQuery: (q: string) => void;
   setResults: (r: SearchResult[]) => void;
@@ -23,6 +24,7 @@ export function useKeyboardShortcuts({
   resultsRef,
   queryRef,
   selectedIndexRef,
+  lastNavMethodRef,
   isSettingsOpenRef,
   setQuery,
   setResults,
@@ -86,6 +88,7 @@ export function useKeyboardShortcuts({
             case 'navigate-up':
               if (!isInput) {
                 e.preventDefault();
+                lastNavMethodRef.current = 'keyboard';
                 setSelectedIndex((prev: number) => Math.max(0, prev - 1));
                 return;
               }
@@ -93,6 +96,7 @@ export function useKeyboardShortcuts({
             case 'navigate-down':
               if (!isInput) {
                 e.preventDefault();
+                lastNavMethodRef.current = 'keyboard';
                 setSelectedIndex((prev: number) => Math.min(prev + 1, Math.max(0, s.results.length - 1)));
                 return;
               }
@@ -105,5 +109,5 @@ export function useKeyboardShortcuts({
 
     window.addEventListener('keydown', handleGlobalKeyDown);
     return () => window.removeEventListener('keydown', handleGlobalKeyDown);
-  }, [searchInputRef, resultsRef, queryRef, selectedIndexRef, isSettingsOpenRef, setQuery, setResults, setSelectedIndex, setIsSettingsOpen, setSettingsTab]);
+  }, [searchInputRef, resultsRef, queryRef, selectedIndexRef, lastNavMethodRef, isSettingsOpenRef, setQuery, setResults, setSelectedIndex, setIsSettingsOpen, setSettingsTab]);
 }

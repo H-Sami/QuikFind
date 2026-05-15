@@ -103,8 +103,7 @@ impl SettingsDatabase {
 
     pub fn save_settings(&self, settings: &AppSettings) -> Result<()> {
         let conn = self.conn.lock();
-        let json =
-            serde_json::to_string(settings).map_err(QuikFindError::Serialization)?;
+        let json = serde_json::to_string(settings).map_err(QuikFindError::Serialization)?;
         conn.execute(
             "INSERT INTO settings (key, value) VALUES ('app_settings', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -185,10 +184,7 @@ impl SettingsDatabase {
     ///
     /// # Errors
     /// Propagates rusqlite errors.
-    pub fn batch_record_indexed_files(
-        &self,
-        files: &[(&str, u64, i64, &str)],
-    ) -> Result<()> {
+    pub fn batch_record_indexed_files(&self, files: &[(&str, u64, i64, &str)]) -> Result<()> {
         let conn = self.conn.lock();
         let tx = conn
             .unchecked_transaction()
@@ -247,11 +243,8 @@ impl SettingsDatabase {
             )
             .ok();
 
-        conn.execute(
-            "DELETE FROM indexed_files WHERE path = ?1",
-            params![path],
-        )
-        .map_err(QuikFindError::Database)?;
+        conn.execute("DELETE FROM indexed_files WHERE path = ?1", params![path])
+            .map_err(QuikFindError::Database)?;
 
         Ok(doc_id)
     }
@@ -318,6 +311,15 @@ impl SettingsDatabase {
             params![id, name, path, now],
         )
         .map_err(QuikFindError::Database)?;
+
+        Ok(())
+    }
+
+    pub fn clear_cached_apps(&self) -> Result<()> {
+        let conn = self.conn.lock();
+
+        conn.execute("DELETE FROM cached_apps", [])
+            .map_err(QuikFindError::Database)?;
 
         Ok(())
     }

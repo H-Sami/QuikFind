@@ -63,7 +63,6 @@ winapi = { version = "0.3", features = ["winuser"] }
 lru = "0.12"
 parking_lot = "0.12"
 chrono = "0.4"
-uuid = { version = "1", features = ["v4"] }
 num_cpus = "1"
 
 [dev-dependencies]

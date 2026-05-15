@@ -1,12 +1,12 @@
 use crate::error::Result;
 use crate::models::AppResult;
 use crate::settings::SettingsDatabase;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
-use uuid::Uuid;
 
 pub struct AppScanner {
     db: Arc<RwLock<SettingsDatabase>>,
@@ -61,23 +61,19 @@ impl AppScanner {
         Ok(scored.into_iter().map(|(_, app)| app).collect())
     }
 
+    /// Returns cached apps without triggering a scan.
+    ///
+    /// # Errors
+    /// Returns an error if the database cannot be read.
+    pub async fn cached_apps(&self) -> Result<Vec<AppResult>> {
+        let db = self.db.read().await;
+        Ok(cached_app_rows_to_results(db.get_cached_apps()?))
+    }
+
     async fn get_or_scan_apps(&self) -> Result<Vec<AppResult>> {
-        {
-            let db = self.db.read().await;
-            let cached = db.get_cached_apps()?;
-            if !cached.is_empty() {
-                let apps: Vec<AppResult> = cached
-                    .into_iter()
-                    .map(|(id, name, path)| AppResult {
-                        id,
-                        name,
-                        path,
-                        icon: None,
-                        score: 0.0,
-                    })
-                    .collect();
-                return Ok(apps);
-            }
+        let cached = self.cached_apps().await?;
+        if !cached.is_empty() {
+            return Ok(cached);
         }
 
         self.scan_and_cache_apps().await
@@ -106,10 +102,12 @@ impl AppScanner {
             apps.extend(scan_linux_apps()?);
         }
 
+        deduplicate_apps(&mut apps);
+
         let db = self.db.read().await;
+        db.clear_cached_apps()?;
         for app in &apps {
-            db.cache_app(&app.id, &app.name, &app.path, None)
-                .ok();
+            db.cache_app(&app.id, &app.name, &app.path, None).ok();
         }
 
         info!(
@@ -120,6 +118,31 @@ impl AppScanner {
 
         Ok(apps)
     }
+}
+
+fn cached_app_rows_to_results(rows: Vec<(String, String, String)>) -> Vec<AppResult> {
+    rows
+        .into_iter()
+        .map(|(id, name, path)| AppResult {
+            id,
+            name,
+            path,
+            icon: None,
+            score: 0.0,
+        })
+        .collect()
+}
+
+#[must_use]
+pub(crate) fn stable_app_id(path: &str) -> String {
+    let normalized = path.replace('\\', "/").to_lowercase();
+    blake3::hash(format!("app:{normalized}").as_bytes()).to_hex()[..16].to_string()
+}
+
+fn deduplicate_apps(apps: &mut Vec<AppResult>) {
+    let mut seen = HashSet::new();
+    apps.retain(|app| seen.insert(app.id.clone()));
+    apps.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.path.cmp(&b.path)));
 }
 
 // REASON: fuzzy score is a relative ranking, not an exact value; float cast is acceptable
@@ -133,8 +156,7 @@ fn compute_simple_fuzzy(query: &str, name: &str) -> f32 {
     let mut consecutive = 0.0;
 
     for &nc in &name_chars {
-        if qi < query_chars.len() && nc.eq_ignore_ascii_case(&query_chars[qi])
-        {
+        if qi < query_chars.len() && nc.eq_ignore_ascii_case(&query_chars[qi]) {
             qi += 1;
             consecutive += 1.0;
             score += consecutive;
@@ -156,20 +178,15 @@ fn scan_windows_apps() -> Vec<AppResult> {
 
     let start_menu_paths = vec![
         PathBuf::from(
-            std::env::var("PROGRAMDATA")
-                .unwrap_or_else(|_| "C:\\ProgramData".to_string()),
+            std::env::var("PROGRAMDATA").unwrap_or_else(|_| "C:\\ProgramData".to_string()),
         )
         .join("Microsoft\\Windows\\Start Menu\\Programs"),
-        PathBuf::from(
-            std::env::var("APPDATA")
-                .unwrap_or_else(|_| {
-                    format!(
-                        "{}\\AppData\\Roaming",
-                        std::env::var("USERPROFILE")
-                            .unwrap_or_else(|_| "C:\\Users\\Default".to_string())
-                    )
-                }),
-        )
+        PathBuf::from(std::env::var("APPDATA").unwrap_or_else(|_| {
+            format!(
+                "{}\\AppData\\Roaming",
+                std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\Users\\Default".to_string())
+            )
+        }))
         .join("Microsoft\\Windows\\Start Menu\\Programs"),
     ];
 
@@ -196,19 +213,17 @@ fn scan_windows_apps() -> Vec<AppResult> {
         if let Ok(entries) = std::fs::read_dir(dir.join("Microsoft\\WindowsApps")) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path
-                    .extension()
-                    .is_some_and(|ext| ext == "exe")
-                {
+                if path.extension().is_some_and(|ext| ext == "exe") {
                     let name = path
                         .file_stem()
                         .map(|s| s.to_string_lossy().to_string())
                         .unwrap_or_default();
-                    let id = Uuid::new_v4().to_string();
+                    let path_str = path.to_string_lossy().to_string();
+                    let id = stable_app_id(&path_str);
                     apps.push(AppResult {
                         id,
                         name,
-                        path: path.to_string_lossy().to_string(),
+                        path: path_str,
                         icon: None,
                         score: 0.0,
                     });
@@ -237,11 +252,12 @@ fn collect_lnk_files(dir: &PathBuf, apps: &mut Vec<AppResult>, depth: u32, max_d
                         .file_stem()
                         .map(|s| s.to_string_lossy().to_string())
                         .unwrap_or_default();
-                    let id = uuid::Uuid::new_v4().to_string();
+                    let path_str = path.to_string_lossy().to_string();
+                    let id = stable_app_id(&path_str);
                     apps.push(AppResult {
                         id,
                         name,
-                        path: path.to_string_lossy().to_string(),
+                        path: path_str,
                         icon: None,
                         score: 0.0,
                     });
@@ -257,11 +273,7 @@ fn scan_macos_apps() -> Result<Vec<AppResult>> {
     let search_paths = vec![
         PathBuf::from("/Applications"),
         PathBuf::from("/Applications/Utilities"),
-        PathBuf::from(
-            dirs::home_dir()
-                .unwrap_or_default()
-                .join("Applications"),
-        ),
+        PathBuf::from(dirs::home_dir().unwrap_or_default().join("Applications")),
         PathBuf::from("/System/Applications"),
         PathBuf::from("/System/Applications/Utilities"),
     ];
@@ -273,23 +285,20 @@ fn scan_macos_apps() -> Result<Vec<AppResult>> {
         if let Ok(entries) = std::fs::read_dir(search_path) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path
-                    .extension()
-                    .map(|ext| ext == "app")
-                    .unwrap_or(false)
-                {
+                if path.extension().map(|ext| ext == "app").unwrap_or(false) {
                     let name = path
                         .file_stem()
                         .map(|s| s.to_string_lossy().to_string())
                         .unwrap_or_default();
-                    let id = Uuid::new_v4().to_string();
+                    let path_str = path.to_string_lossy().to_string();
+                    let id = stable_app_id(&path_str);
 
                     let icon = extract_macos_icon(&path);
 
                     apps.push(AppResult {
                         id,
                         name,
-                        path: path.to_string_lossy().to_string(),
+                        path: path_str,
                         icon,
                         score: 0.0,
                     });
@@ -314,24 +323,20 @@ fn extract_macos_icon(app_path: &PathBuf) -> Option<String> {
                 if ext == "icns" {
                     if let Ok(data) = std::fs::read(&path) {
                         if data.len() < 1024 * 1024 {
-                            return Some(
-                                format!(
-                                    "data:image/x-icns;base64,{}",
-                                    base64_encoding(&data)
-                                ),
-                            );
+                            return Some(format!(
+                                "data:image/x-icns;base64,{}",
+                                base64_encoding(&data)
+                            ));
                         }
                     }
                 }
                 if ext == "png" && path.to_string_lossy().contains("icon") {
                     if let Ok(data) = std::fs::read(&path) {
                         if data.len() < 512 * 1024 {
-                            return Some(
-                                format!(
-                                    "data:image/png;base64,{}",
-                                    base64_encoding(&data)
-                                ),
-                            );
+                            return Some(format!(
+                                "data:image/png;base64,{}",
+                                base64_encoding(&data)
+                            ));
                         }
                     }
                 }
@@ -401,9 +406,6 @@ fn scan_linux_apps() -> Result<Vec<AppResult>> {
         }
     }
 
-    apps.sort_by(|a, b| a.name.cmp(&b.name));
-    apps.dedup_by(|a, b| a.name == b.name);
-
     Ok(apps)
 }
 
@@ -452,7 +454,7 @@ fn parse_desktop_file(path: &PathBuf) -> Option<AppResult> {
         return None;
     }
 
-    let id = Uuid::new_v4().to_string();
+    let id = stable_app_id(&cmd);
     Some(AppResult {
         id,
         name: name.unwrap_or_default(),
@@ -478,5 +480,45 @@ pub fn launch_app(path: &str) -> std::result::Result<(), String> {
             warn!("{err_msg}");
             Err(err_msg)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_ids_are_stable_for_normalized_paths() {
+        let id1 = stable_app_id("C:\\Program Files\\Example\\App.exe");
+        let id2 = stable_app_id("c:/program files/example/app.exe");
+        let id3 = stable_app_id("C:\\Program Files\\Example\\Other.exe");
+
+        assert_eq!(id1, id2);
+        assert_ne!(id1, id3);
+    }
+
+    #[test]
+    fn deduplicate_apps_keeps_one_app_per_stable_id() {
+        let path = "C:\\Tools\\App.exe".to_string();
+        let mut apps = vec![
+            AppResult {
+                id: stable_app_id(&path),
+                name: "App".to_string(),
+                path: path.clone(),
+                icon: None,
+                score: 0.0,
+            },
+            AppResult {
+                id: stable_app_id(&path),
+                name: "App Copy".to_string(),
+                path,
+                icon: None,
+                score: 0.0,
+            },
+        ];
+
+        deduplicate_apps(&mut apps);
+
+        assert_eq!(apps.len(), 1);
     }
 }

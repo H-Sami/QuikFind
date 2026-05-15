@@ -5,7 +5,7 @@ dist/
 # Rust build artifacts (this is the huge folder)
 src-tauri/target/
 
-# Tauri temporary files
+# Local Cargo linker/toolchain overrides
 src-tauri/.cargo/
 
 # Logs and environment

@@ -1,95 +1,80 @@
 # QuikFind Backend
 
-Blazing-fast, private, cross-platform desktop search & launcher built with Rust and Tauri 2.
+Rust and Tauri 2 backend for local desktop search and app launching.
 
 ## Architecture
 
-```
+```text
 src/
-├── main.rs         # Entry point (calls lib::run)
-├── lib.rs          # Tauri app setup, state init, command registration
-├── models.rs       # Data models, Tantivy schema, constants
-├── error.rs        # Error types (thiserror)
-├── settings.rs     # SQLite-backed settings, history, file metadata
-├── search.rs       # Tantivy search engine + nucleo fuzzy matching
-├── indexer.rs      # Parallel file walker (jwalk + rayon)
-├── watcher.rs      # Real-time file watching (notify)
-├── apps.rs         # OS app scanner (Windows/macOS/Linux)
-├── commands.rs     # All Tauri command handlers
-└── plugins.rs      # WASM plugin skeleton (Wasmtime)
+├── main.rs              # Entry point
+├── lib.rs               # App setup and subsystem composition
+├── commands.rs          # Thin Tauri command handlers
+├── indexing.rs          # Single indexing lifecycle owner
+├── indexer.rs           # jwalk/rayon traversal and document construction
+├── search.rs            # Tantivy mechanics, reader reload, query cache
+├── watcher.rs           # notify-based live filesystem deltas
+├── apps.rs              # OS app scanner and launcher
+├── settings.rs          # SQLite settings, history, file metadata, app cache
+├── hotkey.rs            # Hotkey validation and atomic registration
+├── desktop_listener.rs  # Optional Type to Search listener
+├── platform.rs          # Platform helpers
+└── plugins.rs           # In-process plugin registry skeleton
 ```
 
-## Prerequisites
+## Indexing Lifecycle
 
-- Rust 1.77+
-- Tauri 2 CLI: `cargo install tauri-cli --version "^2"`
-- Platform-specific dependencies (see [Tauri docs](https://v2.tauri.app/start/prerequisites/))
+`IndexingSupervisor` is the only source of truth for active indexing state. It owns the current task handle, cancellation signal, phase, status, progress emission, start/stop, and rebuild behavior.
+
+Indexing has two supervised phases:
+
+- `metadata`: walks configured paths and indexes path/name/metadata.
+- `content`: revisits indexed text files and enriches Tantivy documents with bounded text content.
+
+Every index mutation that should be visible to search uses the same path: commit, reload the Tantivy reader, and invalidate query caches. Search commands disable cache use while the supervisor reports an active phase.
+
+`reindex_all` stops active indexing, stops the watcher, clears Tantivy, clears `indexed_files`, and starts a clean rebuild. The watcher is restarted after metadata indexing completes.
+
+## Search
+
+- File identity is a stable hash of normalized path.
+- Re-indexing or watcher upserts replace the document with the same stable ID.
+- Query cache keys include query, limit, offset, max-results, and content-search mode.
+- App results are cached in SQLite and merged into the main `search` command.
+
+## Watcher
+
+The watcher classifies notify events into upserts and removals. Delete paths are preserved even when the file no longer exists. Create, modify, remove, and rename events commit, reload, and invalidate caches when they change the index. Exclusion patterns are shared with the indexer.
+
+## Settings and Hotkeys
+
+Settings persistence is validation-first. Hotkeys are parsed and registered before settings are saved. If registration fails, the previous hotkey remains active and settings are not persisted.
+
+Type to Search is controlled by `enable_type_to_search` and defaults to disabled. The listener starts only when enabled and emits characters only for unmodified text keypresses while the foreground window is the Windows desktop.
+
+## Commands
+
+- `search`
+- `open_path`
+- `launch_app`
+- `start_indexing`
+- `stop_indexing`
+- `reindex_all`
+- `get_index_status`
+- `get_settings`
+- `update_settings`
+- `get_history`
+- `scan_apps_now`
+- `get_plugins`
+- `get_window_state`
+- `save_window_state`
 
 ## Development
-
-```bash
-# Run in dev mode (with hot-reload frontend)
-cargo tauri dev
-
-# Build for production
-cargo tauri build
-```
-
-## Backend-only Build & Test
 
 ```bash
 cd src-tauri
 cargo build
 cargo test
-cargo clippy
+cargo clippy --all-targets -- -D warnings
 ```
 
-## Configuration
-
-Settings database: `~/.config/quikfind/quikfind.db`
-Tantivy index: `~/.config/quikfind/index/`
-Plugin directory: `~/.config/quikfind/plugins/`
-
-## Key Design Decisions
-
-### Search Engine
-- Tantivy with MmapDirectory for memory-mapped indexes
-- Nucleo for fuzzy filename matching (3x weighted vs content)
-- Recency boost for files modified within last 24h
-- LRU query cache (128 entries)
-
-### Indexing
-- jwalk + rayon for parallel directory traversal
-- 1000-document batch commits
-- Content extraction limited to 50KB per text file
-- Glob-based exclusion patterns (node_modules, .git, etc.)
-
-### File Identity
-- Document ID = blake3(path:size:mtime) for dedup
-
-### Performance Targets
-- Search latency: <50ms for 1M+ files
-- Indexing: >50,000 files/min
-- Memory: <50MB idle
-- Binary: <15MB stripped
-
-## Tauri Commands
-
-See `commands.rs` for all commands matching the frontend's expected API:
-- `search`, `get_preview`, `open_path`
-- `start_indexing`, `stop_indexing`, `get_index_status`
-- `get_settings`, `update_settings`
-- `search_apps`, `launch_app`
-- `get_history`, `add_to_history`
-- `reindex_all`, `scan_apps_now`, `get_plugins`
-
-## Plugin System (WASM)
-
-Plugin skeleton uses Wasmtime. Built-in `HelloPlugin` demonstrates the API.
-WASM plugins go in `~/.config/quikfind/plugins/` and are loaded at startup.
-
-## Benchmarks
-
-```bash
-cargo bench
-```
+The repository ignores `src-tauri/.cargo/` intentionally because that directory is for local linker or toolchain overrides.

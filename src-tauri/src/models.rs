@@ -73,6 +73,7 @@ pub struct AppResult {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct IndexStatus {
     pub is_indexing: bool,
+    pub phase: String,
     pub files_indexed: u64,
     pub total_files: u64,
     pub progress_percent: f32,
@@ -81,6 +82,7 @@ pub struct IndexStatus {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(default)]
 pub struct AppSettings {
     pub indexed_paths: Vec<String>,
     pub excluded_patterns: Vec<String>,
@@ -88,8 +90,8 @@ pub struct AppSettings {
     pub hotkey: String,
     pub theme: String,
     pub enable_content_search: bool,
+    pub enable_type_to_search: bool,
     pub indexing_interval_minutes: u32,
-    pub fuzzy_threshold: f32,
     pub launch_on_startup: bool,
 }
 
@@ -110,8 +112,8 @@ impl Default for AppSettings {
             hotkey: "CmdOrCtrl+Space".to_string(),
             theme: "dark".to_string(),
             enable_content_search: true,
+            enable_type_to_search: false,
             indexing_interval_minutes: 30,
-            fuzzy_threshold: 0.6,
             launch_on_startup: false,
         }
     }
@@ -166,13 +168,73 @@ fn build_tantivy_schema() -> Schema {
 }
 
 pub const TEXT_EXTENSIONS: &[&str] = &[
-    "txt", "md", "rs", "py", "js", "ts", "jsx", "tsx", "json", "toml", "yaml", "yml",
-    "html", "css", "scss", "less", "c", "cpp", "h", "hpp", "java", "kt", "swift",
-    "go", "rb", "php", "sh", "bash", "zsh", "fish", "ps1", "bat", "cmd",
-    "xml", "cfg", "conf", "ini", "env", "gitignore", "dockerfile", "makefile",
-    "sql", "r", "m", "mm", "pl", "pm", "lua", "zig", "nim", "ex", "exs",
-    "clj", "cljs", "edn", "scala", "groovy", "gradle", "tex", "bib",
-    "vue", "svelte", "astro", "mjs", "cjs", "mts", "cts",
+    "txt",
+    "md",
+    "rs",
+    "py",
+    "js",
+    "ts",
+    "jsx",
+    "tsx",
+    "json",
+    "toml",
+    "yaml",
+    "yml",
+    "html",
+    "css",
+    "scss",
+    "less",
+    "c",
+    "cpp",
+    "h",
+    "hpp",
+    "java",
+    "kt",
+    "swift",
+    "go",
+    "rb",
+    "php",
+    "sh",
+    "bash",
+    "zsh",
+    "fish",
+    "ps1",
+    "bat",
+    "cmd",
+    "xml",
+    "cfg",
+    "conf",
+    "ini",
+    "env",
+    "gitignore",
+    "dockerfile",
+    "makefile",
+    "sql",
+    "r",
+    "m",
+    "mm",
+    "pl",
+    "pm",
+    "lua",
+    "zig",
+    "nim",
+    "ex",
+    "exs",
+    "clj",
+    "cljs",
+    "edn",
+    "scala",
+    "groovy",
+    "gradle",
+    "tex",
+    "bib",
+    "vue",
+    "svelte",
+    "astro",
+    "mjs",
+    "cjs",
+    "mts",
+    "cts",
 ];
 
 static EXT_SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
@@ -198,9 +260,14 @@ pub fn is_text_extension(path: &str) -> bool {
 }
 
 #[must_use]
-pub fn compute_file_id(path: &str, size: u64, modified: i64) -> String {
-    let input = format!("{path}:{size}:{modified}");
+pub fn compute_file_id(path: &str) -> String {
+    let input = normalized_identity_path(path);
     blake3::hash(input.as_bytes()).to_hex()[..16].to_string()
+}
+
+#[must_use]
+pub fn normalized_identity_path(path: &str) -> String {
+    path.replace('\\', "/").to_lowercase()
 }
 
 #[cfg(test)]
@@ -213,7 +280,10 @@ mod tests {
         assert_eq!(ResultKind::Folder.as_str(), "Folder");
         assert_eq!(ResultKind::App.as_str(), "App");
         assert_eq!("File".parse::<ResultKind>().unwrap().as_str(), "File");
-        assert_eq!("CustomType".parse::<ResultKind>().unwrap().as_str(), "CustomType");
+        assert_eq!(
+            "CustomType".parse::<ResultKind>().unwrap().as_str(),
+            "CustomType"
+        );
     }
 
     #[test]
@@ -232,9 +302,9 @@ mod tests {
 
     #[test]
     fn test_compute_file_id() {
-        let id1 = compute_file_id("/path/to/file.txt", 1024, 1_700_000_000);
-        let id2 = compute_file_id("/path/to/file.txt", 1024, 1_700_000_000);
-        let id3 = compute_file_id("/path/to/other.txt", 2048, 1_700_000_001);
+        let id1 = compute_file_id("/path/to/file.txt");
+        let id2 = compute_file_id("/path/to/file.txt");
+        let id3 = compute_file_id("/path/to/other.txt");
 
         assert_eq!(id1, id2, "Same file should produce same ID");
         assert_ne!(id1, id3, "Different files should produce different IDs");
@@ -248,7 +318,18 @@ mod tests {
         assert_eq!(settings.hotkey, "CmdOrCtrl+Space");
         assert_eq!(settings.theme, "dark");
         assert!(settings.enable_content_search);
+        assert!(!settings.enable_type_to_search);
         assert!(settings.indexed_paths.is_empty());
         assert!(settings.excluded_patterns.len() > 2);
+    }
+
+    #[test]
+    fn test_compute_file_id_is_stable_for_same_path() {
+        let id1 = compute_file_id("C:\\Users\\Ada\\Notes.txt");
+        let id2 = compute_file_id("c:/users/ada/notes.txt");
+        let id3 = compute_file_id("C:\\Users\\Ada\\Other.txt");
+
+        assert_eq!(id1, id2, "Path identity should normalize slashes and case");
+        assert_ne!(id1, id3, "Different paths should produce different IDs");
     }
 }

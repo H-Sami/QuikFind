@@ -21,18 +21,14 @@ pub(crate) fn is_on_desktop() -> bool {
             return false;
         }
 
-        let mut title = [0u16; 256];
-        let len = winapi::um::winuser::GetWindowTextW(hwnd, title.as_mut_ptr(), 256);
-
+        let mut class_name = [0u16; 256];
+        let len = winapi::um::winuser::GetClassNameW(hwnd, class_name.as_mut_ptr(), 256);
         if len == 0 {
-            return true;
+            return false;
         }
 
-        let title_str = String::from_utf16_lossy(&title[..len as usize]);
-
-        title_str == "Program Manager"
-            || title_str.contains("Desktop")
-            || title_str.is_empty()
+        let class_name = String::from_utf16_lossy(&class_name[..len as usize]);
+        class_name == "Progman" || class_name == "WorkerW"
     }
 }
 

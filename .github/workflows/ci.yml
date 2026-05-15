@@ -18,17 +18,29 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
 
-      - name: Build
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Frontend build
+        run: npm run build
+
+      - name: Rust build
         run: cargo build --release
         working-directory: src-tauri
 
       - name: Clippy
-        run: cargo clippy --release -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
         working-directory: src-tauri
 
       - name: Test
